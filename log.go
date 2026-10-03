@@ -16,6 +16,8 @@ type Logger interface {
 	Loopf(format string, args ...any)
 	// Optf logs optimizer iterations and convergence.
 	Optf(format string, args ...any)
+	// Localizef logs cross-session global localization attempts.
+	Localizef(format string, args ...any)
 }
 
 // NewTextLogger writes human-readable lines to w (nil => stderr).
@@ -32,15 +34,19 @@ type textLogger struct{ l *log.Logger }
 func (t *textLogger) Framef(f string, a ...any) { t.l.Printf("frame "+f, a...) }
 func (t *textLogger) Loopf(f string, a ...any)  { t.l.Printf("loop  "+f, a...) }
 func (t *textLogger) Optf(f string, a ...any)   { t.l.Printf("opt   "+f, a...) }
+func (t *textLogger) Localizef(f string, a ...any) {
+	t.l.Printf("loc   "+f, a...)
+}
 
 // NopLogger discards everything.
 func NopLogger() Logger { return nopLogger{} }
 
 type nopLogger struct{}
 
-func (nopLogger) Framef(string, ...any) {}
-func (nopLogger) Loopf(string, ...any)  {}
-func (nopLogger) Optf(string, ...any)   {}
+func (nopLogger) Framef(string, ...any)    {}
+func (nopLogger) Loopf(string, ...any)     {}
+func (nopLogger) Optf(string, ...any)      {}
+func (nopLogger) Localizef(string, ...any) {}
 
 // SliceLogger captures lines, useful in tests for assertions and for the
 // requirement that test logs print inputs, decisions and errors.
@@ -48,6 +54,7 @@ type SliceLogger struct {
 	FrameLines []string
 	LoopLines  []string
 	OptLines   []string
+	LocLines   []string
 }
 
 func (s *SliceLogger) Framef(f string, a ...any) {
@@ -58,4 +65,7 @@ func (s *SliceLogger) Loopf(f string, a ...any) {
 }
 func (s *SliceLogger) Optf(f string, a ...any) {
 	s.OptLines = append(s.OptLines, fmt.Sprintf(f, a...))
+}
+func (s *SliceLogger) Localizef(f string, a ...any) {
+	s.LocLines = append(s.LocLines, fmt.Sprintf(f, a...))
 }

@@ -3,6 +3,7 @@ package slam
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -34,6 +35,23 @@ type Pipeline struct {
 	lastKF      int
 	lastKFOdom  Pose
 	kfsSinceOpt int
+
+	// session is the current independent sensor session. Session 0 is the
+	// original run. Every BeginSession increments it. Each session's wheel
+	// odometry and clock start at zero, so PoseOdom comparisons are only
+	// meaningful within the same session.
+	session int
+	// frameIDBase makes source frame IDs globally unique across sessions:
+	// stored FrameID/TrajectoryPoint.FrameID = source ID + frameIDBase.
+	frameIDBase int64
+	// odomBase is the raw odom pose the current session's deltas are
+	// measured from. lastOdom stores odomBase + consumed delta; sessions
+	// after the first are anchored in the world but their odom hardware
+	// reports motion relative to a freshly powered-on origin.
+	odomBase Pose
+	// awaitAnchor is true after loading a non-empty state: new frames must
+	// not touch anything until BeginSession commits a localization result.
+	awaitAnchor bool
 
 	decisions      []FrameDecision
 	loopLog        []LoopDecision
@@ -138,7 +156,19 @@ func (p *Pipeline) LastOptimize() OptimizeResult {
 func (p *Pipeline) ProcessFrame(fr Frame) FrameDecision {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.awaitAnchor {
+		// A loaded map is waiting for cross-session localization. Feeding
+		// frames straight through here would silently append the new,
+		// unlocalized session to the old trajectory and could corrupt the
+		// old map. Reject and leave every byte of state untouched.
+		d := p.decide(fr, OutcomeRejected, ReasonAwaitingAnchor,
+			"call BeginSession after Localize before processing frames")
+		p.log.Framef("id=%d t=%.3f REJECT %s",
+			fr.Scan.ID, fr.Scan.Time, ReasonAwaitingAnchor)
+		return d
+	}
 	p.frameCount++
+	fr = p.remapFrameLocked(fr)
 
 	clean, scanReason := validateScan(p.cfg, fr.Scan)
 	if scanReason != ReasonOK {
@@ -155,18 +185,25 @@ func (p *Pipeline) ProcessFrame(fr Frame) FrameDecision {
 
 	if fr.Restart {
 		d := p.advanceScanOnly(fr, clean, true)
-		p.lastOdom = fr.Odom.Pose
+		p.odomBase = fr.Odom.Pose
+		p.lastOdom = Pose{}
 		return d
 	}
 	if !fr.HasOdom || !fr.Odom.Valid {
 		return p.advanceScanOnly(fr, clean, false)
 	}
 
-	odomDelta := Between(p.lastOdom, fr.Odom.Pose)
+	// Session-relative odom sample (raw odom minus this session's origin),
+	// then the per-frame delta. Every session powers on at raw odom zero,
+	// but subtracting the base is still required after in-session restarts
+	// and after BeginSession (whose first raw sample need not be exactly 0).
+	sessOdom := Between(p.odomBase, fr.Odom.Pose)
+	odomDelta := Between(p.lastOdom, sessOdom)
 	if math.Hypot(odomDelta.X, odomDelta.Y) > p.cfg.RestartJumpXY ||
 		math.Abs(odomDelta.Theta) > p.cfg.RestartJumpTheta {
 		d := p.advanceScanOnly(fr, clean, true)
-		p.lastOdom = fr.Odom.Pose
+		p.odomBase = fr.Odom.Pose
+		p.lastOdom = Pose{}
 		return d
 	}
 
@@ -255,15 +292,30 @@ func (p *Pipeline) decide(fr Frame, o Outcome, reason, detail string) FrameDecis
 func (p *Pipeline) bootstrap(fr Frame, clean []Point) FrameDecision {
 	base := Pose{}
 	p.lastPose = base
-	p.lastOdom = fr.Odom.Pose
+	p.odomBase = fr.Odom.Pose
+	p.lastOdom = Pose{}
+	p.lastKFOdom = Pose{}
 	p.started = true
-	p.addKeyframeLocked(fr, clean, base, fr.Odom.Pose)
+	p.addKeyframeLocked(fr, clean, base, Pose{})
 	p.grid.integrateScanLocked(base, clean)
 	p.traj = append(p.traj, TrajectoryPoint{fr.Scan.ID, fr.Scan.Time, base})
 	d := p.decide(fr, OutcomeAccepted, ReasonOK, "bootstrap")
 	p.log.Framef("id=%d t=%.3f ACCEPT bootstrap points=%d",
 		fr.Scan.ID, fr.Scan.Time, len(clean))
 	return d
+}
+
+// ReasonAwaitingAnchor marks frames pushed after LoadState but before a
+// successful cross-session localization.
+const ReasonAwaitingAnchor = "awaiting_session_anchor"
+
+// remapFrameLocked gives the frame a process-wide unique ID and a session
+// time offset so sessions with reset clocks never collide. The source values
+// are preserved in the decision Detail/logs via the pre-call IDs.
+func (p *Pipeline) remapFrameLocked(fr Frame) Frame {
+	fr.Scan.ID += p.frameIDBase
+	fr.Odom.ID += p.frameIDBase
+	return fr
 }
 
 func (p *Pipeline) advanceScanOnly(fr Frame, clean []Point, restart bool) FrameDecision {
@@ -300,12 +352,13 @@ func (p *Pipeline) advanceFused(fr Frame, clean []Point,
 		p.lastScan = append(p.lastScan[:0], clean...)
 	}
 	if fr.HasOdom && fr.Odom.Valid {
-		p.lastOdom = fr.Odom.Pose
+		p.lastOdom = Between(p.odomBase, fr.Odom.Pose)
 	}
 	p.traj = append(p.traj, TrajectoryPoint{fr.Scan.ID, fr.Scan.Time, pose})
 
 	if clean != nil {
-		kf := p.maybeKeyframe(fr, clean, pose, fr.Odom.Pose)
+		kf := p.maybeKeyframe(fr, clean, pose,
+			Between(p.odomBase, fr.Odom.Pose))
 		if kf >= 0 {
 			p.grid.integrateScanLocked(p.graph.Nodes[kf].Pose,
 				p.graph.Nodes[kf].Scan)
@@ -324,8 +377,12 @@ func (p *Pipeline) advanceFused(fr Frame, clean []Point,
 				// Defer global correction once a loop exists: applying it
 				// repeatedly without rebuilding the map would desync map
 				// and trajectory. Finalize performs the single aligned
-				// optimize+rebuild pass.
-				if !hasLoop {
+				// optimize+rebuild pass. A cross-session graph is likewise
+				// optimized only at Finalize: early in a new session the
+				// anchor has just one or two constraints while the new
+				// odom chain is already long, so incremental optimization
+				// would drag the freshly anchored start off the old map.
+				if !hasLoop && p.session == 0 {
 					p.runOptimizeLocked("incremental")
 				}
 				p.kfsSinceOpt = 0
@@ -351,11 +408,38 @@ func (p *Pipeline) referencePointsLocked(pred Pose) []Point {
 	for i := n - 1; i >= start; i-- {
 		kf := p.graph.Nodes[i]
 		if PoseDist(kf.Pose, pred) > refRadius {
+			// Keyframes from a previous session are skipped here rather
+			// than counted against the budget (their odom/session frame is
+			// unrelated); fall through to the geometric fallback below.
 			continue
 		}
 		pts = append(pts, kf.SurfaceWorld()...)
-		// Also include raw scans of the two newest keyframes for fine
-		// detail near the current pose.
+	}
+	// Cross-session anchor fallback: right after BeginSession the newest
+	// keyframes belong to the old session and are far away, so the loop
+	// above contributes nothing. Fill the reference from geometrically
+	// nearby keyframes of ANY session (the overlap area).
+	if len(pts) < 8 {
+		type near struct{ idx, rank int }
+		var cands []near
+		for i, kf := range p.graph.Nodes {
+			if PoseDist(kf.Pose, pred) <= refRadius {
+				rank := 0
+				if kf.Session != p.session {
+					rank = 1
+				}
+				cands = append(cands, near{i, rank})
+			}
+		}
+		sort.Slice(cands, func(a, b int) bool {
+			if cands[a].rank != cands[b].rank {
+				return cands[a].rank < cands[b].rank
+			}
+			return cands[a].idx > cands[b].idx
+		})
+		for k := 0; k < len(cands) && k < maxRefKeyframes; k++ {
+			pts = append(pts, p.graph.Nodes[cands[k].idx].SurfaceWorld()...)
+		}
 	}
 	// Deduplicate surface cells across keyframes.
 	pts = rasterizeHits(pts, p.cfg.MapResolution)

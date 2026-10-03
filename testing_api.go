@@ -47,3 +47,19 @@ func ExportDiagInfoFromEdge(e *Edge) [3][3]float64 { return e.RawInfo }
 func ExportMatchScan(cfg Config, ref []Point, scan []Point, pred Pose) MatchResult {
 	return matchScan(cfg, ref, scan, pred)
 }
+
+// The following helpers back the state-compatibility unit tests. They write
+// deliberately malformed/versioned gob states through the same atomic path
+// used by Save, so LoadState's validation/version handling can be exercised
+// without reaching into unexported types from the external test package.
+
+// ExportWriteFutureState writes a state claiming a newer on-disk version.
+func ExportWriteFutureState(path string) error {
+	return writeTestState(path, 999, false)
+}
+
+// ExportWriteDanglingEdgeState writes a structurally invalid v2 state whose
+// single edge references a missing node.
+func ExportWriteDanglingEdgeState(path string) error {
+	return writeTestState(path, stateVersion, true)
+}

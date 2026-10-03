@@ -29,6 +29,28 @@
 
 ## 扫描匹配与融合
 
+## 跨会话全局定位与地图合并
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `LocalizeCoarseStepXY/Theta` | 0.5 m / 0.196 rad | 全图粗搜索的位置 / 朝向栅格 |
+| `LocalizeCoarseScanPts` | 90 | 粗搜索降采样点数（计算有界） |
+| `LocalizeHintRadiusXY/Theta` | 2.0 m / 0.6 rad | 给粗略线索时的搜索半径 |
+| `LocalizeRefineWinXY/Theta` | 0.8 m / 0.35 rad | 每个粗候选的局部精配准窗口 |
+| `LocalizeKFRefRadius` | 6.0 m | 参与局部参考的旧关键帧半径 |
+| `LocalizeMinScore` | 0.55 | 唯一解最低内点分数 |
+| `LocalizeMaxResidual` | 0.20 m | 唯一解最大点面 RMS |
+| `LocalizeScoreMargin` | 0.15 | 与空间分离的次优候选最小分数差 |
+| `LocalizeEdgeSigmaXY/Th` | 0.08 m / 0.05 rad | 锚定 / 跨会话边信息 |
+| `LocalizeMaxAnchors` | 2 | 会话起点锚定边数量上限 |
+| `LocalizeCrossSessionRadius` | 1.5 m | 跨会话重访的世界系近邻半径 |
+| `LocalizeCrossMinScore` | 0.70 | 跨会话重访只接受强对齐 |
+| `MapOccPersist` | 2.0 | 超过该 log-odds 的占据格不被自由射线擦除 |
+
+判定：`unique` = 最佳分数/残差达标且与次优空间分离候选差距足够；
+`ambiguous` = 存在另一个位姿显著不同、分数与残差都达标且分数差小于
+margin 的候选；其余为 `failed`（见 `docs/multi-session.md`）。
+
 | 参数 | 默认 | 含义 |
 |---|---|---|
 | `FieldResolution/Inflate` | 0.05 / 0.30 | 似然场分辨率、高斯影响半径 |

@@ -25,13 +25,19 @@ func (p *Pipeline) addKeyframeLocked(fr Frame, clean []Point, pose, odomPose Pos
 	surface := rasterizeHits(transformAll(pose, surfaceScan), p.cfg.MapResolution)
 	kf := &Keyframe{
 		ID: idx, FrameID: fr.Scan.ID, Time: fr.Scan.Time,
-		Pose: pose, PoseOdom: odomPose, Scan: scan,
-		surfaceBase: pose, Surface: surface,
+		Pose: pose, PoseOdom: odomPose, Session: p.session, Scan: scan,
+		SurfaceBase: pose, Surface: surface,
 		UpdatedAt: p.frameCount,
 	}
 	p.graph.Nodes = append(p.graph.Nodes, kf)
 	if p.lastKF >= 0 {
 		prev := p.graph.Nodes[p.lastKF]
+		if prev.Session != p.session {
+			// Different odom origins: no relative odom edge exists.
+			p.lastKF = idx
+			p.lastKFOdom = odomPose
+			return idx
+		}
 		rel := Between(prev.Pose, pose)
 		info := diagInfo(p.cfg.OdomEdgeSigmaXY, p.cfg.OdomEdgeSigmaTh)
 		p.graph.Edges = append(p.graph.Edges, &Edge{

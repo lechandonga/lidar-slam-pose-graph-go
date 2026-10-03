@@ -17,7 +17,12 @@ import (
 func main() {
 	out := flag.String("out", ".", "output directory")
 	seed := flag.Int64("seed", 42, "random seed")
+	mode := flag.String("mode", "loop", "loop | split (two independent sessions)")
 	flag.Parse()
+	if *mode == "split" {
+		runSplitDemo(*out, *seed)
+		return
+	}
 
 	world := synth.RectWorld(14, 10, []struct{ X, Y, Ww, Hh float64 }{
 		{0, 0, 2, 2},

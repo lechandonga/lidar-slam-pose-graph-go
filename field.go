@@ -68,6 +68,13 @@ func (f *likelihoodField) cell(x, y float64) (int, int) {
 	return int(math.Floor((x - f.originX) / f.res)), int(math.Floor((y - f.originY) / f.res))
 }
 
+// bounds returns the world bounding box covered by the field cells.
+func (f *likelihoodField) bounds() (minX, minY, maxX, maxY float64) {
+	return f.originX, f.originY,
+		f.originX + float64(f.w)*f.res,
+		f.originY + float64(f.h)*f.res
+}
+
 // response is exp(-d^2/(2 sigma^2)), in [0,1].
 func (f *likelihoodField) responseAt(x, y float64) float64 {
 	cx, cy := f.cell(x, y)

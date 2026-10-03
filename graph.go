@@ -40,10 +40,13 @@ type Keyframe struct {
 	Time     float64
 	Pose     Pose // optimized, world frame
 	PoseOdom Pose // odom-frame pose at capture
-	Scan     []Point
-	// surfaceBase is the pose at which Surface was rasterized; after graph
+	// Session identifies the independent sensor session (each new session
+	// has its own zeroed odom/clock). Session 0 is the original run.
+	Session int
+	Scan    []Point
+	// SurfaceBase is the pose at which Surface was rasterized; after graph
 	// optimization the surface is corrected to the current Pose.
-	surfaceBase Pose
+	SurfaceBase Pose
 	// Surface is the dense local wall surface (rasterized hit cells in the
 	// world frame at capture time) used for scan-matching references.
 	Surface   []Point

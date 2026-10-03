@@ -133,24 +133,39 @@ func (g *Grid) ensureSize(minX, minY, maxX, maxY float64) {
 		return
 	}
 	const block = 50
-	nw := int((nMaxX-nMinX)/g.res) + 2
-	nh := int((nMaxY-nMinY)/g.res) + 2
-	nw = ((nw + block - 1) / block) * block
-	nh = ((nh + block - 1) / block) * block
-	// Keep old content aligned on integer cells.
-	spanX := float64(nw) * g.res
-	spanY := float64(nh) * g.res
-	newOX := nMaxX - spanX
-	newOY := nMaxY - spanY
-	if newOX > nMinX {
-		newOX = nMinX
+	// Extend each side by a whole number of blocks so the allocation stays
+	// bounded and old content keeps an EXACT integer-cell offset. Extending
+	// only as far as needed (rather than recomputing a bounding origin)
+	// avoids shifting the lattice and misplacing previously mapped walls.
+	leftCells := 0
+	if minX < g.ox {
+		need := int((g.ox-minX)/g.res) + 1
+		leftCells = ((need + block - 1) / block) * block
 	}
-	if newOY > nMinY {
-		newOY = nMinY
+	botCells := 0
+	if minY < g.oy {
+		need := int((g.oy-minY)/g.res) + 1
+		botCells = ((need + block - 1) / block) * block
 	}
+	rightEdge := g.ox + float64(g.w)*g.res
+	rightCells := 0
+	if maxX > rightEdge {
+		need := int((maxX-rightEdge)/g.res) + 1
+		rightCells = ((need + block - 1) / block) * block
+	}
+	topEdge := g.oy + float64(g.h)*g.res
+	topCells := 0
+	if maxY > topEdge {
+		need := int((maxY-topEdge)/g.res) + 1
+		topCells = ((need + block - 1) / block) * block
+	}
+	nw := g.w + leftCells + rightCells
+	nh := g.h + botCells + topCells
+	newOX := g.ox - float64(leftCells)*g.res
+	newOY := g.oy - float64(botCells)*g.res
 	nl := make([]float64, nw*nh)
-	offX := int(math.Round((g.ox - newOX) / g.res))
-	offY := int(math.Round((g.oy - newOY) / g.res))
+	offX := leftCells
+	offY := botCells
 	for y := 0; y < g.h; y++ {
 		if y+offY < 0 {
 			continue
@@ -166,26 +181,29 @@ func (g *Grid) ensureSize(minX, minY, maxX, maxY float64) {
 // the pipeline write lock and must pass locked=true to avoid self-deadlock;
 // standalone callers pass locked=false.
 func (g *Grid) integrateScanLocked(p Pose, scan []Point) {
-	if g.w == 0 {
-		minX, minY := p.X, p.Y
-		maxX, maxY := minX, minY
-		for _, pt := range scan {
-			w := p.Transform(pt)
-			if w.X < minX {
-				minX = w.X
-			}
-			if w.Y < minY {
-				minY = w.Y
-			}
-			if w.X > maxX {
-				maxX = w.X
-			}
-			if w.Y > maxY {
-				maxY = w.Y
-			}
+	// Bounds of this scan in the world frame; grow the grid whenever it
+	// falls outside the current extent. Growth must happen on EVERY scan,
+	// not only the first one: a robot that keeps walking emits endpoints far
+	// beyond the initial grid, and silently dropping out-of-range rays would
+	// freeze the map at its first-frame footprint.
+	minX, minY := p.X, p.Y
+	maxX, maxY := minX, minY
+	for _, pt := range scan {
+		w := p.Transform(pt)
+		if w.X < minX {
+			minX = w.X
 		}
-		g.ensureSize(minX, minY, maxX, maxY)
+		if w.Y < minY {
+			minY = w.Y
+		}
+		if w.X > maxX {
+			maxX = w.X
+		}
+		if w.Y > maxY {
+			maxY = w.Y
+		}
 	}
+	g.ensureSize(minX, minY, maxX, maxY)
 	c := g.cfg
 	for _, pt := range scan {
 		w := p.Transform(pt)
@@ -210,8 +228,13 @@ func (g *Grid) castRay(x0, y0, x1, y1 float64, c Config) {
 		cy := int(math.Floor((y - g.oy) / g.res))
 		if cx >= 0 && cy >= 0 && cx < g.w && cy < g.h {
 			idx := cy*g.w + cx
-			g.logOdds[idx] = math.Max(-c.MapLogOddMax,
-				math.Min(c.MapLogOddMax, g.logOdds[idx]+c.MapLogOddFree))
+			// Confirmed-occupied cells are never erased by free-space
+			// crossings: a later session sweeping a ray across a wall the
+			// old session saw must not turn the wall into free space.
+			if g.logOdds[idx] < c.MapOccPersist {
+				g.logOdds[idx] = math.Max(-c.MapLogOddMax,
+					math.Min(c.MapLogOddMax, g.logOdds[idx]+c.MapLogOddFree))
+			}
 		}
 		x += ux
 		y += uy
@@ -277,6 +300,36 @@ func (g *Grid) raw() ([]float64, *MapSnapshot) {
 	cp := make([]float64, len(g.logOdds))
 	copy(cp, g.logOdds)
 	return cp, g.snapshot()
+}
+
+// hitCellsWorld returns the world-frame center points of cells currently
+// classified as occupied. It is the global reference used by cross-session
+// localization: every old keyframe surface is already projected into the
+// saved map, so this set never depends on the new session's odom frame.
+func (g *Grid) hitCellsWorld() []Point {
+	out := make([]Point, 0)
+	for cy := 0; cy < g.h; cy++ {
+		for cx := 0; cx < g.w; cx++ {
+			if g.logOdds[cy*g.w+cx] > 0.4 {
+				out = append(out, Point{
+					X: g.ox + (float64(cx)+0.5)*g.res,
+					Y: g.oy + (float64(cy)+0.5)*g.res,
+				})
+			}
+		}
+	}
+	return out
+}
+
+// occupiedCount counts occupied cells (used by tests/diagnostics).
+func (g *Grid) occupiedCount() int {
+	n := 0
+	for _, v := range g.logOdds {
+		if v > 0.4 {
+			n++
+		}
+	}
+	return n
 }
 
 func (g *Grid) loadRaw(res, ox, oy float64, w, h int, vals []float64) {

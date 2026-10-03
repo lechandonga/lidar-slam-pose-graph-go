@@ -76,6 +76,25 @@ CGO_ENABLED=1 go test -race -run TestConcurrentMapQueries .
 测试日志（`-v`）打印：每类输入的门控判定、关键判定原因、优化迭代/收敛/
 代价、以及 RMSE 等误差指标。
 
+## 3.5 两段独立会话（里程计 / 时钟各自归零）
+
+`synth.SplitSessions(world, path, opt, cut1, cut2)` 把一条完整轨迹切成两段
+（`cut2 < cut1` 时两段有重叠），并让每段都成为**独立的一次开机**：
+
+- 每段扫描和里程计都以自己的起点为原点重新表达（里程计从 0 积分）；
+- 帧时间从 0 开始；
+- 两段使用相互独立的噪声种子（由 `opt.Seed` 派生），模拟真实的不同上电
+  周期；
+- 同时返回每段在公共世界系的真值 `TruthWorld` 和第二段起点 `StartWorld`，
+  供评估全局定位误差。
+
+```go
+a, b, fullTruth := synth.SplitSessions(world, path, opt, 30, 24)
+srcA, srcB := synth.SessionSource(a), synth.SessionSource(b)
+// 先消费 srcA、存档；Load 后 PrepareNewSession，再用 srcB 的首帧 Localize、
+// BeginSession，然后继续消费 srcB。完整示例见 docs/multi-session.md。
+```
+
 ## 4. 误差度量
 
 测试与 demo 的轨迹 RMSE 都先做初始 SE2 对齐（流水线把首帧锚定在世界

@@ -98,7 +98,26 @@ Finalize:
 `p.Save(path)` 先写临时文件再原子 rename，且拒绝写入含 NaN/Inf 的状态；
 `LoadState(path, logger)` 读回后可继续处理。保存-在中段-加载-续跑与一次跑完
 结果一致（`TestSaveResumeEquivalent`），不会留下半更新的地图或轨迹。
-关键帧的未导出字段 `surfaceBase` 通过自定义 gob 编解码一并保存。
+关键帧的匹配表面基准与逐帧决策日志一并保存。
+
+## 跨会话建图（同一场地分几次扫）
+
+换个地方重新开机、每段里程计和时钟都从 0 开始时，新一段会先在旧地图里做
+**全局定位**：定位唯一才锚定进旧世界坐标系；对不上或存在多个都说得通的
+位置时给出可区分的结论且**绝不改动旧图**。重叠区通过跨会话回环合并，已
+确认占据不会被重复扫描擦除，`Finalize` 后地图随轨迹统一重建。v1 状态文件
+可迁移读取，未知版本 / 损坏文件被明确拒绝。前提、判定规则与本地复现见
+[`docs/multi-session.md`](docs/multi-session.md)：
+
+```go
+loaded, _ := root.LoadState("site.gob", logger)
+loaded.PrepareNewSession()              // 新的一次开机
+lr := loaded.Localize(firstScan, root.LocalizeHint{}) // 只读，不改状态
+if lr.Status == root.LocalizeUnique {   // ambiguous/failed 不污染旧图
+    loaded.BeginSession(firstFrame, lr) // 锚定到旧世界系
+    // …继续 ProcessFrame；Finalize 统一优化并重建地图
+}
+```
 
 ## 并发
 
@@ -125,6 +144,8 @@ Finalize:
 | `keyframe.go` | 关键帧、有界表面/扫描 |
 | `graph.go` | SE2 位姿图、GN+LM 优化、稠密求解 |
 | `loop.go` | 回环检测/门控/记录、Finalize |
+| `reloc.go` | 跨会话全局定位（unique/ambiguous/failed 判定） |
+| `session.go` | 新会话准备/锚定、会话与帧 ID 管理 |
 | `map.go` | 对数几率栅格、射线、快照、重建 |
 | `state.go` | 原子化 gob 持久化 |
 | `bridge.go` | 内存回放源 |

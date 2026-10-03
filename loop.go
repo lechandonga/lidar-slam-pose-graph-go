@@ -22,39 +22,83 @@ type loopCandidate struct {
 func (p *Pipeline) tryLoopClosure(k int) {
 	kf := p.graph.Nodes[k]
 	var cands []loopCandidate
+	cross := map[int]loopCandidate{}
 	checked := 0
 	for j := 0; j < k; j++ {
 		old := p.graph.Nodes[j]
-		if k-j < p.cfg.LoopMinFrames {
+		sameSession := old.Session == kf.Session
+		if sameSession {
+			// Within one session, proximity is tested in the drift-free
+			// odometry frame; far or too-recent keyframes cannot be loops
+			// but can still be cross-session revisits below.
+			if k-j < p.cfg.LoopMinFrames {
+				continue
+			}
+			if PoseDist(old.PoseOdom, kf.PoseOdom) > p.cfg.LoopOdomRadius {
+				continue
+			}
+			checked++
+			if checked > 8 {
+				break
+			}
+			odomRel := Between(old.PoseOdom, kf.PoseOdom)
+			mr := p.alignKeyframesLocked(old, kf, odomRel,
+				math.Max(p.cfg.LoopSearchRadius, 1.0), true)
+			if !mr.CoarseOK {
+				continue
+			}
+			cands = append(cands, loopCandidate{
+				j: j, score: mr.Score, scanRel: mr.Pose, odomRel: odomRel,
+			})
 			continue
 		}
-		if PoseDist(old.PoseOdom, kf.PoseOdom) > p.cfg.LoopOdomRadius {
+		// Different session: odom frames are unrelated, so proximity and
+		// the alignment seed come from the WORLD frame.
+		if PoseDist(old.Pose, kf.Pose) > p.cfg.LocalizeCrossSessionRadius {
 			continue
 		}
-		checked++
-		if checked > 8 {
-			break
+		if p.hasEdgeBetween(j, k) {
+			continue
 		}
-		odomRel := Between(old.PoseOdom, kf.PoseOdom)
-		localSurface := rasterizeHits(old.Scan, p.cfg.MapResolution)
-		lcfg := p.cfg
-		lcfg.MatchWinXY = math.Max(p.cfg.LoopSearchRadius, 1.0)
-		lcfg.MatchWinTheta = math.Pi
-		lcfg.CoarseStepXY = 0.12
-		lcfg.CoarseStepTheta = 0.08
-		lcfg.RefineIter = 10
-		mr := matchScan(lcfg, localSurface, subsample(kf.Scan, 240), odomRel)
+		// Seed in old's LOCAL frame: alignKeyframes matches the new local
+		// scan against the old local scan. The resulting scanRel is then
+		// rotated into the world frame via relToWorld, exactly like
+		// same-session strong loop edges.
+		localSeed := Pose{Theta: normAngle(kf.Pose.Theta - old.Pose.Theta)}
+		mr := p.alignKeyframesLocked(old, kf, localSeed, 1.0, true)
 		if !mr.CoarseOK {
 			continue
 		}
-		fine := buildLikelihoodField(localSurface,
-			p.cfg.FieldResolution, p.cfg.FieldInflate)
-		if s, n := fine.score(mr.Pose, kf.Scan); n > 0 {
-			mr.Score = s
+		if mr.Score < p.cfg.LocalizeCrossMinScore {
+			continue
 		}
-		cands = append(cands, loopCandidate{
-			j: j, score: mr.Score, scanRel: mr.Pose, odomRel: odomRel,
-		})
+		cross[j] = loopCandidate{
+			j: j, score: mr.Score, scanRel: mr.Pose, odomRel: mr.Pose,
+		}
+	}
+	// Commit strong cross-session revisits immediately. They bypass odom
+	// gating (the two odom frames are incomparable) and only strong
+	// alignments are accepted, so a wrong place cannot silently merge.
+	crossList := make([]loopCandidate, 0, len(cross))
+	for _, cd := range cross {
+		crossList = append(crossList, cd)
+	}
+	sort.Slice(crossList, func(a, b int) bool {
+		if crossList[a].score != crossList[b].score {
+			return crossList[a].score > crossList[b].score
+		}
+		return crossList[a].j < crossList[b].j
+	})
+	crossAdded := 0
+	for _, cd := range crossList {
+		// One strong cross-session link per new keyframe is enough given
+		// the intra-session chain and the start anchor; adding several
+		// identical-score edges for the same overlap only bloats the graph.
+		if crossAdded >= 1 {
+			break
+		}
+		p.addCrossSessionEdgeLocked(k, cd)
+		crossAdded++
 	}
 	if len(cands) == 0 {
 		return
@@ -88,8 +132,6 @@ func (p *Pipeline) tryLoopClosure(k int) {
 				fmt.Sprintf("loop_contradicts_odom dxy=%.2f dth=%.2f", dxy, dth))
 			continue
 		case cd.score >= p.cfg.LoopStrongScore:
-			// Strong scan alignment. Convert the scan-frame relative
-			// translation into node i's world frame for the edge measure.
 			worldMeasure := relToWorld(p.graph.Nodes[cd.j].Pose, cd.scanRel)
 			p.graph.Edges = append(p.graph.Edges, &Edge{
 				I: cd.j, J: k, Kind: EdgeLoop, Measure: worldMeasure,
@@ -118,6 +160,57 @@ func (p *Pipeline) tryLoopClosure(k int) {
 			break
 		}
 	}
+}
+
+// alignKeyframesLocked scan-matches new keyframe k against old keyframe j's
+// local surface, starting from seed (relative motion in old's local frame
+// for same-session candidates, world-relative for cross-session ones).
+func (p *Pipeline) alignKeyframesLocked(old, kf *Keyframe, seed Pose,
+	winXY float64, rescore bool) MatchResult {
+	localSurface := rasterizeHits(old.Scan, p.cfg.MapResolution)
+	lcfg := p.cfg
+	lcfg.MatchWinXY = winXY
+	lcfg.MatchWinTheta = math.Pi
+	lcfg.CoarseStepXY = 0.12
+	lcfg.CoarseStepTheta = 0.08
+	lcfg.RefineIter = 10
+	mr := matchScan(lcfg, localSurface, subsample(kf.Scan, 240), seed)
+	if !mr.CoarseOK {
+		return mr
+	}
+	if rescore {
+		fine := buildLikelihoodField(localSurface,
+			p.cfg.FieldResolution, p.cfg.FieldInflate)
+		if s, n := fine.score(mr.Pose, kf.Scan); n > 0 {
+			mr.Score = s
+		}
+	}
+	return mr
+}
+
+// addCrossSessionEdgeLocked inserts an accepted cross-session revisit edge.
+// The measure is the scan-aligned world-frame relative transform; only
+// strong matches reach here (see LocalizeCrossMinScore).
+func (p *Pipeline) addCrossSessionEdgeLocked(k int, cd loopCandidate) {
+	info := diagInfo(p.cfg.LocalizeEdgeSigmaXY, p.cfg.LocalizeEdgeSigmaTh)
+	worldMeasure := relToWorld(p.graph.Nodes[cd.j].Pose, cd.scanRel)
+	if p.hasEdgeBetween(cd.j, k) {
+		return
+	}
+	p.graph.Edges = append(p.graph.Edges, &Edge{
+		I: cd.j, J: k, Kind: EdgeLoop, Measure: worldMeasure,
+		Info: info, RawInfo: info, Status: LoopAccepted,
+		Reason: "cross_session_revisit",
+	})
+	dec := LoopDecision{
+		Time: p.graph.Nodes[k].Time, From: cd.j, To: k,
+		Score: cd.score, Measure: worldMeasure,
+		Status: LoopAccepted, WeightScale: 1,
+		Reason: "cross_session_revisit",
+	}
+	p.loopLog = append(p.loopLog, dec)
+	p.log.Loopf("kf=%d -> %d CROSS-SESSION score=%.2f measure=%s",
+		k, cd.j, cd.score, worldMeasure)
 }
 
 func (p *Pipeline) logLoop(k int, cd loopCandidate, status LoopStatus,
@@ -154,7 +247,7 @@ func (k *Keyframe) ScanInWorld() []Point {
 // SurfaceWorld returns the dense matching surface corrected to the current
 // optimized pose.
 func (k *Keyframe) SurfaceWorld() []Point {
-	corr := k.Pose.Compose(k.surfaceBase.Inv())
+	corr := k.Pose.Compose(k.SurfaceBase.Inv())
 	out := make([]Point, len(k.Surface))
 	for i, pt := range k.Surface {
 		out[i] = corr.Transform(pt)

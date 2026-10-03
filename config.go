@@ -84,6 +84,44 @@ type Config struct {
 	MapLogOddFree float64
 	MapLogOddMax  float64
 	MapMaxRayStep int // ray samples per ray cap (bounded cost)
+	// MapOccPersist is the log-odds level above which a cell counts as
+	// confirmed occupied: free-space ray crossings never decrease it, so a
+	// wall confirmed in one session cannot be erased by a later session
+	// sweeping a ray across the same cell (repeated traversals stay sharp
+	// instead of smearing into unknown/free).
+	MapOccPersist float64
+
+	// --- Cross-session global localization ---
+	// Coarse global scan over the old map: raster spacing, angle spacing
+	// and how many scan points the cheap overlap stage uses.
+	LocalizeCoarseStepXY    float64
+	LocalizeCoarseStepTheta float64
+	LocalizeCoarseScanPts   int
+	// Search radius around a user-supplied pose/heading hint.
+	LocalizeHintRadiusXY    float64
+	LocalizeHintRadiusTheta float64
+	// Refinement windows around each surviving coarse candidate.
+	LocalizeRefineWinXY    float64
+	LocalizeRefineWinTheta float64
+	LocalizeKFRefRadius    float64 // old keyframes within this feed the local ref
+	// Decision thresholds:
+	//   unique   = best score >= MinScore, best RMS <= MaxResidual and
+	//              best-second score gap >= ScoreMargin;
+	//   ambiguous= a spatially distinct second candidate also clears
+	//              MinScore/MaxResidual within the margin;
+	//   failed   = anything else (nothing is committed).
+	LocalizeMinScore    float64
+	LocalizeMaxResidual float64
+	LocalizeScoreMargin float64
+	// Information of the anchor constraint(s) inserted at session start.
+	LocalizeEdgeSigmaXY float64
+	LocalizeEdgeSigmaTh float64
+	LocalizeMaxAnchors  int
+	// CrossSessionRadius is the world-frame radius for detecting revisits
+	// of old-session areas while a new session runs (odom frames differ
+	// across sessions so odom-proximity loop search cannot find them).
+	LocalizeCrossSessionRadius float64
+	LocalizeCrossMinScore      float64 // accept only strong cross-session matches
 
 	// --- Runtime ---
 	OptEveryNKeyframes int // incremental optimization cadence
@@ -152,6 +190,24 @@ func DefaultConfig() Config {
 		MapLogOddFree: -0.30,
 		MapLogOddMax:  4.0,
 		MapMaxRayStep: 1000,
+		MapOccPersist: 2.0,
+
+		LocalizeCoarseStepXY:       0.5,
+		LocalizeCoarseStepTheta:    0.19635, // ~11.25 degrees, 32 heading bins
+		LocalizeCoarseScanPts:      90,
+		LocalizeHintRadiusXY:       2.0,
+		LocalizeHintRadiusTheta:    0.6,
+		LocalizeRefineWinXY:        0.8,
+		LocalizeRefineWinTheta:     0.35,
+		LocalizeKFRefRadius:        6.0,
+		LocalizeMinScore:           0.55,
+		LocalizeMaxResidual:        0.20,
+		LocalizeScoreMargin:        0.15,
+		LocalizeEdgeSigmaXY:        0.08,
+		LocalizeEdgeSigmaTh:        0.05,
+		LocalizeMaxAnchors:         2,
+		LocalizeCrossSessionRadius: 1.5,
+		LocalizeCrossMinScore:      0.70,
 
 		OptEveryNKeyframes: 5,
 		RNGSeed:            1,
