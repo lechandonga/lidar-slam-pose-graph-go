@@ -25,17 +25,38 @@ func (p *Pipeline) tryLoopClosure(k int) {
 	checked := 0
 	for j := 0; j < k; j++ {
 		old := p.graph.Nodes[j]
-		if k-j < p.cfg.LoopMinFrames {
+		crossSession := old.Session != kf.Session
+		// Within a session require index separation to skip the odom
+		// chain; across sessions the index gap is irrelevant, only world
+		// proximity matters.
+		if !crossSession && k-j < p.cfg.LoopMinFrames {
 			continue
 		}
-		if PoseDist(old.PoseOdom, kf.PoseOdom) > p.cfg.LoopOdomRadius {
+		// Odometry-frame proximity is meaningful only within one session
+		// (each session's odom frame restarts at zero). Across sessions we
+		// test proximity in the common world frame instead.
+		if !crossSession &&
+			PoseDist(old.PoseOdom, kf.PoseOdom) > p.cfg.LoopOdomRadius {
+			continue
+		}
+		crossRadius := p.cfg.LoopOdomRadius * 2.5
+		if crossSession &&
+			(PoseDist(old.Pose, kf.Pose) > crossRadius ||
+				math.Abs(normAngle(old.Pose.Theta-kf.Pose.Theta)) > 1.2) {
 			continue
 		}
 		checked++
 		if checked > 8 {
 			break
 		}
-		odomRel := Between(old.PoseOdom, kf.PoseOdom)
+		// Alignment prediction: local odom chain within a session; the
+		// current world estimate across sessions.
+		var odomRel Pose
+		if crossSession {
+			odomRel = Between(old.Pose, kf.Pose)
+		} else {
+			odomRel = Between(old.PoseOdom, kf.PoseOdom)
+		}
 		localSurface := rasterizeHits(old.Scan, p.cfg.MapResolution)
 		lcfg := p.cfg
 		lcfg.MatchWinXY = math.Max(p.cfg.LoopSearchRadius, 1.0)
@@ -63,6 +84,11 @@ func (p *Pipeline) tryLoopClosure(k int) {
 		return cands[a].score > cands[b].score
 	})
 	raw := diagInfo(p.cfg.LoopSigmaXY, p.cfg.LoopSigmaTh)
+	// Cross-session strong alignments are the ONLY link between two
+	// independently drifted odom frames. Weight them like the (stiff) odom
+	// chain so the optimizer actually pulls the overlap together instead of
+	// letting the drifted chain dominate.
+	rawCross := diagInfo(p.cfg.OdomEdgeSigmaXY*1.5, p.cfg.OdomEdgeSigmaTh*1.5)
 	added := 0
 	for _, cd := range cands {
 		if cd.score < p.cfg.LoopMinScore {
@@ -91,9 +117,13 @@ func (p *Pipeline) tryLoopClosure(k int) {
 			// Strong scan alignment. Convert the scan-frame relative
 			// translation into node i's world frame for the edge measure.
 			worldMeasure := relToWorld(p.graph.Nodes[cd.j].Pose, cd.scanRel)
-			p.graph.Edges = append(p.graph.Edges, &Edge{
+			info := raw
+			if p.graph.Nodes[cd.j].Session != kf.Session {
+				info = rawCross
+			}
+			p.appendEdgeDedupLocked(&Edge{
 				I: cd.j, J: k, Kind: EdgeLoop, Measure: worldMeasure,
-				Info: raw, RawInfo: raw, Status: LoopAccepted, Chi2: chi2,
+				Info: info, RawInfo: info, Status: LoopAccepted, Chi2: chi2,
 			})
 			p.logLoop(k, cd, LoopAccepted, 1, raw, chi2,
 				fmt.Sprintf("loop_strong chi2=%.1f dxy=%.2f", chi2, dxy))
@@ -104,7 +134,7 @@ func (p *Pipeline) tryLoopClosure(k int) {
 			if scale <= 0 || scale > 1 {
 				scale = 0.5
 			}
-			p.graph.Edges = append(p.graph.Edges, &Edge{
+			p.appendEdgeDedupLocked(&Edge{
 				I: cd.j, J: k, Kind: EdgeLoop, Measure: cd.odomRel,
 				Info: scaleInfo(raw, scale), RawInfo: raw, Status: LoopSoft,
 				Chi2: chi2, Reason: "loop_weak_align",
@@ -170,6 +200,7 @@ func (p *Pipeline) runOptimizeLocked(why string) OptimizeResult {
 	for i, kf := range p.graph.Nodes {
 		prevPoses[i] = kf.Pose
 	}
+	p.lastPrevPoses = prevPoses
 	r := optimizeGraph(p.graph, p.cfg)
 	maxMove := 0.0
 	for i := range p.graph.Nodes {
@@ -187,9 +218,6 @@ func (p *Pipeline) runOptimizeLocked(why string) OptimizeResult {
 	p.log.Optf("%s nodes=%d edges=%d iters=%d converged=%v cost %.3f -> %.3f",
 		why, len(p.graph.Nodes), len(p.graph.Edges),
 		r.Iterations, r.Converged, before, after)
-	if why == "final" {
-		p.retargetTrajectoryLocked(prevPoses)
-	}
 	p.lastOptMaxMove = maxMove
 	for _, kf := range p.graph.Nodes {
 		kf.UpdatedAt = p.frameCount
@@ -211,35 +239,62 @@ func (p *Pipeline) retargetTrajectoryLocked(prevPoses []Pose) {
 	if len(p.graph.Nodes) == 0 {
 		return
 	}
-	exact := make(map[int64]Pose, len(p.graph.Nodes))
 	type cand struct {
-		fid      int64
+		seq      int64
 		old, new Pose
 	}
 	cands := make([]cand, 0, len(p.graph.Nodes))
 	for i, kf := range p.graph.Nodes {
-		exact[kf.FrameID] = kf.Pose
-		cands = append(cands, cand{kf.FrameID, prevPoses[i], kf.Pose})
+		cands = append(cands, cand{kf.Seq, prevPoses[i], kf.Pose})
+	}
+	sessBySeq := make(map[int64]int, len(cands))
+	for _, kf := range p.graph.Nodes {
+		sessBySeq[kf.Seq] = kf.Session
 	}
 	for i := range p.traj {
 		tp := &p.traj[i]
-		if q, ok := exact[tp.FrameID]; ok {
-			tp.Pose = q
-			continue
-		}
 		best, bestD := 0, int64(math.MaxInt64)
+		bestSession := -1
+		bestAny, bestAnyD := 0, 1<<52
 		for j := range cands {
-			d := cands[j].fid - tp.FrameID
+			d := cands[j].seq - tp.Seq
 			if d < 0 {
 				d = -d
 			}
+			if d < int64(bestAnyD) {
+				bestAnyD, bestAny = int(d), j
+			}
+			// Prefer a keyframe from the same session: FrameIDs and clocks
+			// restart independently per session, so Seq distance is only
+			// meaningful within one session.
+			if sessBySeq[cands[j].seq] == tp.Session {
+				d -= 1 << 40
+			}
 			if d < bestD {
 				bestD, best = d, j
+				bestSession = sessBySeq[cands[j].seq]
 			}
 		}
 		c := cands[best]
-		tp.Pose = c.new.Compose(c.old.Inv()).Compose(tp.Pose)
+		if bestSession == tp.Session && bestD < 1<<40 {
+			tp.Pose = c.new.Compose(c.old.Inv()).Compose(tp.Pose)
+		} else if bestAnyD < 1<<52 {
+			// Keyframe was merged into another session's node during
+			// compaction: snap to the surviving node (same physical spot).
+			ca := cands[bestAny]
+			tp.Pose = ca.new
+		}
 	}
+}
+
+// trajKeyframeSession returns the session that produced keyframe seq.
+func (p *Pipeline) trajKeyframeSession(seq int64) int {
+	for _, kf := range p.graph.Nodes {
+		if kf.Seq == seq {
+			return kf.Session
+		}
+	}
+	return -1
 }
 
 // Finalize runs the last optimization and rebuilds the grid when poses
@@ -247,11 +302,26 @@ func (p *Pipeline) retargetTrajectoryLocked(prevPoses []Pose) {
 func (p *Pipeline) Finalize() OptimizeResult {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	r := p.runOptimizeLocked("final")
-	if p.lastOptMaxMove > p.cfg.OptConvergeDelta {
-		p.grid.rebuildFromKeyframes(p.graph.Nodes)
-		p.lastOptMaxMove = 0
+	// 1) Bring every session's keyframes to a consistent optimum.
+	r := p.runOptimizeLocked("final_no_retarget")
+	// 2) Merge keyframes describing the same physical spot across sessions
+	//    (prevents re-scanned overlaps from duplicating nodes/edges/cells).
+	if p.compactGraphLocked() {
+		p.log.Optf("compaction merged cross-session keyframes: nodes=%d edges=%d",
+			len(p.graph.Nodes), len(p.graph.Edges))
+		pre := make([]Pose, len(p.graph.Nodes))
+		for i, kf := range p.graph.Nodes {
+			pre[i] = kf.Pose
+		}
+		r = p.runOptimizeLocked("post_compact")
+		p.lastPrevPoses = pre
 	}
+	// 3) Apply keyframe corrections to non-keyframe trajectory points, then
+	//    rebuild the grid once from final poses: trajectory and map share
+	//    exactly the same poses, with no doubled contours.
+	p.retargetTrajectoryLocked(p.lastPrevPoses)
+	p.grid.rebuildFromKeyframes(p.graph.Nodes)
+	p.lastOptMaxMove = 0
 	return r
 }
 

@@ -12,7 +12,12 @@ import (
 )
 
 // stateVersion must be bumped when the on-disk layout changes.
-const stateVersion = 1
+//
+//	v1: single-session layout (no Seq/Session on keyframes, no session bookkeeping).
+//	v2: multi-session support; v1 files migrate transparently because the
+//	    added fields have safe zero values (everything is session 0).
+const stateVersion = 2
+const minSupportedStateVersion = 1
 
 // savedState is the complete resumable state. Everything needed to continue
 // a run identically is captured here.
@@ -32,6 +37,12 @@ type savedState struct {
 	LastKFOdom Pose
 	LastScan   []Point
 
+	Session         int
+	PendingSession  bool
+	LocalizeStart   Pose
+	LastKFBySession map[int]int
+	LocalizeLog     []LocalizeDecision
+
 	Decisions []FrameDecision
 	LoopLog   []LoopDecision
 	OptLog    []OptLogEntry
@@ -49,7 +60,9 @@ type savedState struct {
 type keyframeGob struct {
 	ID                          int
 	FrameID                     int64
+	Seq                         int64
 	Time                        float64
+	Session                     int
 	Pose, PoseOdom, SurfaceBase Pose
 	Scan, Surface               []Point
 	UpdatedAt                   int64
@@ -59,7 +72,8 @@ type keyframeGob struct {
 func (k *Keyframe) GobEncode() ([]byte, error) {
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(keyframeGob{
-		ID: k.ID, FrameID: k.FrameID, Time: k.Time,
+		ID: k.ID, FrameID: k.FrameID, Seq: k.Seq, Session: k.Session,
+		Time: k.Time,
 		Pose: k.Pose, PoseOdom: k.PoseOdom, SurfaceBase: k.surfaceBase,
 		Scan: k.Scan, Surface: k.Surface, UpdatedAt: k.UpdatedAt,
 	}); err != nil {
@@ -75,7 +89,8 @@ func (k *Keyframe) GobDecode(data []byte) error {
 		return err
 	}
 	*k = Keyframe{
-		ID: kg.ID, FrameID: kg.FrameID, Time: kg.Time,
+		ID: kg.ID, FrameID: kg.FrameID, Seq: kg.Seq, Session: kg.Session,
+		Time: kg.Time,
 		Pose: kg.Pose, PoseOdom: kg.PoseOdom, surfaceBase: kg.SurfaceBase,
 		Scan: kg.Scan, Surface: kg.Surface, UpdatedAt: kg.UpdatedAt,
 	}
@@ -89,19 +104,54 @@ func (p *Pipeline) snapshotStateLocked() savedState {
 	gridRes, ox, oy := g.res, g.ox, g.oy
 	gw, gh := g.w, g.h
 
+	// Deep-copy the graph and slices: Save releases the lock before gob
+	// encoding, so the snapshot must not share mutable storage with the
+	// live pipeline (otherwise concurrent ProcessFrame races the encoder).
+	nodes := make([]*Keyframe, len(p.graph.Nodes))
+	for i, kf := range p.graph.Nodes {
+		k := *kf
+		k.Scan = append([]Point(nil), kf.Scan...)
+		k.Surface = append([]Point(nil), kf.Surface...)
+		nodes[i] = &k
+	}
+	edges := make([]*Edge, len(p.graph.Edges))
+	for i, e := range p.graph.Edges {
+		ec := *e
+		edges[i] = &ec
+	}
+	traj := append([]TrajectoryPoint(nil), p.traj...)
+	lastScan := append([]Point(nil), p.lastScan...)
+
 	st := savedState{
 		Version: stateVersion, Config: p.cfg,
-		Nodes: p.graph.Nodes, Edges: p.graph.Edges,
-		Traj:       p.traj,
+		Nodes: nodes, Edges: edges,
+		Traj:       traj,
 		FrameCount: p.frameCount,
 		LastPose:   p.lastPose, LastOdom: p.lastOdom,
 		Started: p.started, LastKF: p.lastKF, LastKFOdom: p.lastKFOdom,
-		LastScan:  p.lastScan,
-		Decisions: p.decisions, LoopLog: p.loopLog, OptLog: p.optLog,
-		GridRes: gridRes, GridOX: ox, GridOY: oy,
+		LastScan: lastScan,
+		Session:  p.session, PendingSession: p.pendingSession,
+		LocalizeStart:   p.localizeStart,
+		LastKFBySession: copyIntIntMap(p.lastKFBySession),
+		LocalizeLog:     append([]LocalizeDecision(nil), p.localizeLog...),
+		Decisions:       append([]FrameDecision(nil), p.decisions...),
+		LoopLog:         append([]LoopDecision(nil), p.loopLog...),
+		OptLog:          append([]OptLogEntry(nil), p.optLog...),
+		GridRes:         gridRes, GridOX: ox, GridOY: oy,
 		GridW: gw, GridH: gh, GridValues: vals,
 	}
 	return st
+}
+
+func copyIntIntMap(in map[int]int) map[int]int {
+	if in == nil {
+		return map[int]int{}
+	}
+	out := make(map[int]int, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // Save atomically writes the full state to path. It writes to a sibling
@@ -109,6 +159,14 @@ func (p *Pipeline) snapshotStateLocked() savedState {
 // leave a half-written trajectory or map.
 func (p *Pipeline) Save(path string) error {
 	p.mu.Lock()
+	// Persist a compacted, optimized state so repeated
+	// save -> reload -> short run -> save cycles do not accumulate
+	// duplicate cross-session keyframes or constraints. The grid keeps its
+	// incremental content until Finalize does the final rebuild.
+	p.runOptimizeLocked("save")
+	if p.compactGraphLocked() {
+		p.runOptimizeLocked("post_compact_save")
+	}
 	st := p.snapshotStateLocked()
 	p.mu.Unlock()
 	return writeStateAtomic(path, st)
@@ -153,11 +211,20 @@ func LoadState(path string, logger Logger) (*Pipeline, error) {
 	var st savedState
 	dec := gob.NewDecoder(f)
 	if err := dec.Decode(&st); err != nil {
-		return nil, err
+		// Never hand back a half-decoded pipeline; surface the exact error.
+		return nil, fmt.Errorf("slam: state file is corrupt or not a slam snapshot: %w", err)
 	}
-	if st.Version != stateVersion {
-		return nil, fmt.Errorf("slam: unsupported state version %d (want %d)",
-			st.Version, stateVersion)
+	if st.Version < minSupportedStateVersion || st.Version > stateVersion {
+		return nil, fmt.Errorf(
+			"slam: unsupported state version %d (supported %d..%d); "+
+				"rebuild from raw data or re-save with a compatible version",
+			st.Version, minSupportedStateVersion, stateVersion)
+	}
+	if err := st.validateLoaded(); err != nil {
+		return nil, fmt.Errorf("slam: refusing state file: %w", err)
+	}
+	if st.Version < stateVersion {
+		migrateState(&st)
 	}
 	if logger == nil {
 		logger = NopLogger()
@@ -165,6 +232,60 @@ func LoadState(path string, logger Logger) (*Pipeline, error) {
 	p := NewPipeline(st.Config, logger)
 	p.restoreStateLocked(st)
 	return p, nil
+}
+
+// validateLoaded guards against files that decode structurally but would
+// assemble a half-new/half-old pipeline.
+func (s *savedState) validateLoaded() error {
+	if s.GridW < 0 || s.GridH < 0 {
+		return fmt.Errorf("invalid grid dimensions %dx%d", s.GridW, s.GridH)
+	}
+	for i, kf := range s.Nodes {
+		if kf == nil {
+			return fmt.Errorf("node %d is nil", i)
+		}
+		if kf.ID != i {
+			return fmt.Errorf("node %d has mismatched stored id %d", i, kf.ID)
+		}
+	}
+	for i, e := range s.Edges {
+		if e == nil || e.I < 0 || e.J < 0 ||
+			e.I >= len(s.Nodes) || e.J >= len(s.Nodes) || e.I == e.J {
+			return fmt.Errorf("edge %d references invalid nodes", i)
+		}
+	}
+	return nil
+}
+
+// migrateState upgrades a decoded older snapshot in place. v1 -> v2: the
+// added session fields default to "session 0", which is exactly what a
+// single-session v1 file represents.
+func migrateState(st *savedState) {
+	if st.Version != 1 {
+		return
+	}
+	st.Session = 0
+	st.LastKFBySession = map[int]int{}
+	if len(st.Nodes) > 0 {
+		st.LastKFBySession[0] = st.LastKF
+		seqByFrame := make(map[int64]int64, len(st.Traj))
+		for i, tp := range st.Traj {
+			seqByFrame[tp.FrameID] = int64(i) + 1
+		}
+		for _, kf := range st.Nodes {
+			kf.Session = 0
+			if kf.Seq == 0 {
+				kf.Seq = seqByFrame[kf.FrameID]
+			}
+		}
+		for i := range st.Traj {
+			st.Traj[i].Session = 0
+			if st.Traj[i].Seq == 0 {
+				st.Traj[i].Seq = int64(i) + 1
+			}
+		}
+	}
+	st.Version = 2
 }
 
 func (p *Pipeline) restoreStateLocked(st savedState) {
@@ -180,6 +301,11 @@ func (p *Pipeline) restoreStateLocked(st savedState) {
 	p.lastKF = st.LastKF
 	p.lastKFOdom = st.LastKFOdom
 	p.lastScan = append([]Point(nil), st.LastScan...)
+	p.session = st.Session
+	p.pendingSession = st.PendingSession
+	p.localizeStart = st.LocalizeStart
+	p.lastKFBySession = copyIntIntMap(st.LastKFBySession)
+	p.localizeLog = append([]LocalizeDecision(nil), st.LocalizeLog...)
 	p.decisions = st.Decisions
 	p.loopLog = st.LoopLog
 	p.optLog = st.OptLog

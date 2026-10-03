@@ -12,6 +12,8 @@ type TrajectoryPoint struct {
 	FrameID int64
 	Time    float64
 	Pose    Pose
+	Seq     int64 // pipeline-wide unique sequence across sessions
+	Session int   // session this point belongs to
 }
 
 // Pipeline is the local 2-D SLAM front/back-end. State mutates only under
@@ -35,11 +37,22 @@ type Pipeline struct {
 	lastKFOdom  Pose
 	kfsSinceOpt int
 
+	// Session support. Each session has its own odom frame and clock;
+	// session >= 1 is "in session". lastKFBySession[s] is the most recent
+	// keyframe created by session s, so odom-chain edges never span the
+	// reset boundary between sessions.
+	session         int
+	pendingSession  bool // BeginSessionLocalize failed/ambiguous; awaiting retry
+	localizeStart   Pose // accepted fix for the pending/active session
+	lastKFBySession map[int]int
+	localizeLog     []LocalizeDecision
+
 	decisions      []FrameDecision
 	loopLog        []LoopDecision
 	optLog         []OptLogEntry
 	lastOpt        OptimizeResult
 	lastOptMaxMove float64
+	lastPrevPoses  []Pose
 }
 
 // LoopDecision records an attempted loop constraint and its classification.
@@ -52,6 +65,18 @@ type LoopDecision struct {
 	WeightScale float64
 	Reason      string
 	Measure     Pose
+}
+
+// LocalizeDecision records a cross-session localization attempt with its
+// quality numbers so operators can judge why a fix was or was not applied.
+type LocalizeDecision struct {
+	Session     int
+	Status      LocalizeStatus
+	Reason      string
+	Best        LocalizeHypothesis
+	Second      LocalizeHypothesis
+	ScoreMargin float64
+	WithHint    bool
 }
 
 // OptLogEntry captures one optimization call for tests and logs.
@@ -71,12 +96,30 @@ func NewPipeline(cfg Config, logger Logger) *Pipeline {
 		logger = NopLogger()
 	}
 	return &Pipeline{
-		cfg:    cfg,
-		log:    logger,
-		graph:  &Graph{},
-		grid:   newGrid(cfg),
-		lastKF: -1,
+		cfg:             cfg,
+		log:             logger,
+		graph:           &Graph{},
+		grid:            newGrid(cfg),
+		lastKF:          -1,
+		lastKFBySession: map[int]int{},
 	}
+}
+
+// SessionID reports the currently active session (0 for the first run).
+func (p *Pipeline) SessionID() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.session
+}
+
+// LocalizeDecisions returns the log of all cross-session localization
+// attempts, including failures and ambiguous fixes that changed nothing.
+func (p *Pipeline) LocalizeDecisions() []LocalizeDecision {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]LocalizeDecision, len(p.localizeLog))
+	copy(out, p.localizeLog)
+	return out
 }
 
 func (p *Pipeline) Run(src DataSource) error {
@@ -146,6 +189,14 @@ func (p *Pipeline) ProcessFrame(fr Frame) FrameDecision {
 			fmt.Sprintf("raw_points=%d", len(fr.Scan.Points)))
 		p.log.Framef("id=%d t=%.3f REJECT %s raw_points=%d",
 			fr.Scan.ID, fr.Scan.Time, scanReason, len(fr.Scan.Points))
+		return d
+	}
+
+	if p.pendingSession {
+		d := p.decide(fr, OutcomeRejected, ReasonSessionNotLocalized,
+			"session start not localized; call BeginSessionLocalize")
+		p.log.Framef("id=%d REJECT %s", fr.Scan.ID,
+			ReasonSessionNotLocalized)
 		return d
 	}
 
@@ -257,13 +308,126 @@ func (p *Pipeline) bootstrap(fr Frame, clean []Point) FrameDecision {
 	p.lastPose = base
 	p.lastOdom = fr.Odom.Pose
 	p.started = true
-	p.addKeyframeLocked(fr, clean, base, fr.Odom.Pose)
+	p.addKeyframeLocked(fr, clean, base, fr.Odom.Pose, p.session)
 	p.grid.integrateScanLocked(base, clean)
-	p.traj = append(p.traj, TrajectoryPoint{fr.Scan.ID, fr.Scan.Time, base})
+	p.traj = append(p.traj, TrajectoryPoint{
+		FrameID: fr.Scan.ID, Time: fr.Scan.Time, Pose: base,
+		Seq: p.frameCount, Session: p.session,
+	})
 	d := p.decide(fr, OutcomeAccepted, ReasonOK, "bootstrap")
 	p.log.Framef("id=%d t=%.3f ACCEPT bootstrap points=%d",
 		fr.Scan.ID, fr.Scan.Time, len(clean))
 	return d
+}
+
+// anchorSessionLocked fixes the first accepted scan of a new, independently
+// clocked/odometry session at its globally localized world pose and anchors
+// it to the old graph with a relocation constraint. The odom chain for the
+// new session starts from zero and is NOT linked to the old session's tail.
+func (p *Pipeline) anchorSessionLocked(fr Frame, clean []Point, fix Pose) (FrameDecision, int) {
+	p.lastPose = fix
+	p.lastOdom = fr.Odom.Pose
+	p.lastScan = append(p.lastScan[:0], clean...)
+	p.started = true
+	p.pendingSession = false
+	kfIdx := p.addKeyframeLocked(fr, clean, fix, fr.Odom.Pose, p.session)
+	// Relocation edge to the geometrically nearest older-session keyframe.
+	// The measure is Between(old,new); node 0's fixed pose is unaffected.
+	bestJ, bestD := -1, math.MaxFloat64
+	for j, kf := range p.graph.Nodes {
+		if j == kfIdx || kf.Session >= p.session {
+			continue
+		}
+		if d := PoseDist(kf.Pose, fix); d < bestD {
+			bestD, bestJ = d, j
+		}
+	}
+	edgeIdx := -1
+	if bestJ >= 0 {
+		info := diagInfo(p.cfg.OdomEdgeSigmaXY*1.5, p.cfg.OdomEdgeSigmaTh*1.5)
+		edgeIdx = p.appendEdgeDedupLocked(&Edge{
+			I: bestJ, J: kfIdx, Kind: EdgeReloc,
+			Measure: Between(p.graph.Nodes[bestJ].Pose, fix),
+			Info:    info, RawInfo: info, Status: LoopAccepted,
+			Reason: "session_relocation",
+		})
+	}
+	p.grid.integrateScanLocked(fix, clean)
+	p.traj = append(p.traj, TrajectoryPoint{
+		FrameID: fr.Scan.ID, Time: fr.Scan.Time, Pose: fix,
+		Seq: p.frameCount, Session: p.session,
+	})
+	d := p.decide(fr, OutcomeAccepted, ReasonLocalized, fmt.Sprintf(
+		"session=%d fix=%s anchor_kf=%d", p.session, fix, bestJ))
+	p.log.Framef("id=%d SESSION %d anchored fix=%s anchor_kf=%d edge=%d",
+		fr.Scan.ID, p.session, fix, bestJ, edgeIdx)
+	return d, edgeIdx
+}
+
+// BeginSessionLocalize starts a new mapping session whose start pose, clock
+// and wheel odometry are unrelated to the loaded state. The first scan is
+// aligned globally against the old map. On a unique strong fix the session
+// is anchored in the old world frame and subsequent ProcessFrame calls run
+// there; on failure or ambiguity NOTHING in the old map/trajectory/graph is
+// modified and the session stays pending (retry with a hint). hint may be
+// nil for an unconstrained full-map search.
+func (p *Pipeline) BeginSessionLocalize(first Frame, hint *LocalizeHint) LocalizeResult {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.beginSessionLocalizeLocked(first, hint)
+}
+
+func (p *Pipeline) beginSessionLocalizeLocked(fr Frame, hint *LocalizeHint) LocalizeResult {
+	clean, reason := validateScan(p.cfg, fr.Scan)
+	res := LocalizeResult{Status: LocalizeFailed, AppliedEdge: -1}
+	if reason != ReasonOK {
+		res.Reason = reason
+		p.recordLocalizeLocked(res, hint)
+		return res
+	}
+	if !p.started {
+		// Nothing to localize against: behave as a normal first run.
+		p.session = 0
+		p.bootstrap(fr, clean)
+		res.Status = LocalizeUnique
+		res.Reason = "fresh_start"
+		p.recordLocalizeLocked(res, hint)
+		return res
+	}
+	lr := p.globalLocalize(clean, hint)
+	if lr.Status != LocalizeUnique {
+		// Old state stays byte-for-byte intact; remember intent so frames
+		// cannot slip in un-localized.
+		p.pendingSession = true
+		p.recordLocalizeLocked(lr, hint)
+		return lr
+	}
+	p.session++
+	p.pendingSession = false
+	p.frameCount++
+	fr2 := fr
+	fr2.Restart = true
+	_, edgeIdx := p.anchorSessionLocked(fr2, clean, lr.Applied)
+	lr.AppliedEdge = edgeIdx
+	p.recordLocalizeLocked(lr, hint)
+	return lr
+}
+
+func (p *Pipeline) recordLocalizeLocked(res LocalizeResult, hint *LocalizeHint) {
+	d := LocalizeDecision{
+		Session: p.session, Status: res.Status, Reason: res.Reason,
+		Best: res.Best, Second: res.Second, ScoreMargin: res.ScoreMargin,
+		WithHint: hint != nil && hint.HasPose,
+	}
+	p.localizeLog = append(p.localizeLog, d)
+	with := "no-hint"
+	if d.WithHint {
+		with = "hint"
+	}
+	p.log.Loopf("localize session=%d %s %s best_score=%.2f rms=%.3f "+
+		"margin=%.2f %s fix=%s", p.session, res.Status, res.Reason,
+		res.Best.Score, res.Best.ResidualRMS, res.ScoreMargin, with,
+		res.Applied)
 }
 
 func (p *Pipeline) advanceScanOnly(fr Frame, clean []Point, restart bool) FrameDecision {
@@ -302,10 +466,13 @@ func (p *Pipeline) advanceFused(fr Frame, clean []Point,
 	if fr.HasOdom && fr.Odom.Valid {
 		p.lastOdom = fr.Odom.Pose
 	}
-	p.traj = append(p.traj, TrajectoryPoint{fr.Scan.ID, fr.Scan.Time, pose})
+	p.traj = append(p.traj, TrajectoryPoint{
+		FrameID: fr.Scan.ID, Time: fr.Scan.Time, Pose: pose,
+		Seq: p.frameCount, Session: p.session,
+	})
 
 	if clean != nil {
-		kf := p.maybeKeyframe(fr, clean, pose, fr.Odom.Pose)
+		kf := p.maybeKeyframe(fr, clean, pose, fr.Odom.Pose, p.session)
 		if kf >= 0 {
 			p.grid.integrateScanLocked(p.graph.Nodes[kf].Pose,
 				p.graph.Nodes[kf].Scan)

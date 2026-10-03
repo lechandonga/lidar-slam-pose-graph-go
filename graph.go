@@ -8,6 +8,7 @@ type EdgeKind int
 const (
 	EdgeOdom EdgeKind = iota
 	EdgeLoop
+	EdgeReloc // cross-session global-localization anchor constraint
 )
 
 // LoopStatus values make contradictory constraints distinguishable.
@@ -37,6 +38,8 @@ type Edge struct {
 type Keyframe struct {
 	ID       int
 	FrameID  int64
+	Seq      int64 // pipeline-wide unique frame sequence (FrameID/Time restart per session)
+	Session  int   // session that created this keyframe
 	Time     float64
 	Pose     Pose // optimized, world frame
 	PoseOdom Pose // odom-frame pose at capture
@@ -109,7 +112,7 @@ func optimizeGraph(g *Graph, cfg Config) OptimizeResult {
 			xi, xj := g.Nodes[e.I].Pose, g.Nodes[e.J].Pose
 			err := edgeError(xi, xj, e.Measure)
 			rw := 1.0
-			if e.Kind == EdgeLoop {
+			if e.Kind == EdgeLoop || e.Kind == EdgeReloc {
 				rw = huberWeight(err, e.Info, cfg.OptHuberDelta)
 			}
 			Ai, Aj := edgeJacobians(xi, xj)

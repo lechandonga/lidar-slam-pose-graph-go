@@ -92,3 +92,18 @@
 | `OptHuberDelta` | 4.0 | 回环边 Huber 核 δ |
 
 收敛条件、LM 阻尼阶梯、只接受代价下降步等见 README“优化器”一节。
+
+## 跨会话全局定位与合并
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `LocalizeMinScore` | 0.55 | 候选定位最低对齐分数，低于即 failed |
+| `LocalizeStrongScore` | 0.78 | 唯一接受所需的强分数 |
+| `LocalizeAmbiguousMargin` | 0.08 | 最佳/次佳分差小于此值判 ambiguous |
+| `LocalizeMaxRMS` | 0.12 m | 接受定位允许的点面残差 RMS 上限 |
+| `LocalizeCoarseXY/Theta` | 0.5 m / 0.20 rad | 粗搜索网格步长 |
+| `LocalizeHintXYWin/ThetaWin` | 1.5 m / 0.6 rad | 有 hint 时的搜索窗口 |
+| `CompactDistXY/Theta` | 0.25 m / 0.15 rad | 跨会话关键帧压缩合并阈值 |
+| `MapFreezeOccupied` | true | 已占据单元不被后续射线清空 |
+
+完整判定规则、状态版本兼容与本地复现见 [`cross-session.md`](cross-session.md)。

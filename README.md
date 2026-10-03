@@ -100,6 +100,19 @@ Finalize:
 结果一致（`TestSaveResumeEquivalent`），不会留下半更新的地图或轨迹。
 关键帧的未导出字段 `surfaceBase` 通过自定义 gob 编解码一并保存。
 
+## 跨会话建图（换位置重新开机）
+
+机器搬到新位置、里程计和时钟都归零后再扫第二段时，用
+`p.BeginSessionLocalize(firstFrame, hint)` 在旧图里做全局定位：起点落在
+旧图覆盖内即可自动求出旧世界系位姿并锚定，之后整段在旧世界系跑。定位
+返回**可区分**的三种结论——`unique`（含对齐分数、残差 RMS、与次佳解的
+分差）/ `ambiguous`（多个位置都像）/ `failed`（对不上）；后两者**不改动
+任何旧地图、轨迹和位姿图**，可带粗略 hint 重试。重叠区通过跨会话回环边
+和图压缩合并成一条轨迹、一张无重影地图；已占据单元不会因重复扫过被擦
+除；反复“加载→扫→保存”不会膨胀。状态文件 v1 自动迁移、损坏/未来版本
+明确拒绝。详见 [`docs/cross-session.md`](docs/cross-session.md)，测试见
+`crosssession_test.go`。
+
 ## 并发
 
 所有可变状态由 `Pipeline.mu`（RWMutex）保护：采集/优化/地图写入持写锁，

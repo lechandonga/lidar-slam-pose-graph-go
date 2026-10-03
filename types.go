@@ -72,7 +72,59 @@ const (
 	ReasonBadScan         = "bad_scan"
 	ReasonRestart         = "odom_restart_reanchored"
 	ReasonOdomInvalid     = "odom_invalid_sample"
+	// Cross-session global localization outcomes.
+	ReasonLocalized           = "global_localized"
+	ReasonLocalizeFail        = "global_localize_failed"
+	ReasonLocalizeAmbig       = "global_localize_ambiguous"
+	ReasonLocalizeReject      = "global_localize_rejected"
+	ReasonSessionNotLocalized = "session_not_localized"
 )
+
+// LocalizeStatus is the verdict of cross-session global localization.
+type LocalizeStatus string
+
+const (
+	// LocalizeUnique: one strong, well-separated fix; it was applied.
+	LocalizeUnique LocalizeStatus = "unique"
+	// LocalizeAmbiguous: several plausible fixes could not be separated;
+	// the old state was left untouched.
+	LocalizeAmbiguous LocalizeStatus = "ambiguous"
+	// LocalizeFailed: no alignment met the quality gates; old state
+	// untouched.
+	LocalizeFailed LocalizeStatus = "failed"
+)
+
+// LocalizeHint optionally narrows global localization to the vicinity of an
+// approximate start pose expressed in the OLD session's world frame. A nil
+// hint means "search the whole previous map with a full heading sweep".
+type LocalizeHint struct {
+	Pose     Pose
+	HasPose  bool
+	WinXY    float64 // override default hint window (0 => config default)
+	WinTheta float64
+}
+
+// LocalizeHypothesis is one candidate start pose with its quality numbers.
+type LocalizeHypothesis struct {
+	Pose        Pose
+	Score       float64 // [0,1] fine alignment score
+	ResidualRMS float64 // mean point-to-surface residual, metres
+	EigRatio    float64
+	WeakAxes    [3]bool
+}
+
+// LocalizeResult is the explainable outcome of BeginSessionLocalize.
+type LocalizeResult struct {
+	Status LocalizeStatus
+	Reason string
+	// Applied is the world-frame start pose actually used; valid only when
+	// Status == LocalizeUnique.
+	Applied      Pose
+	Hypotheses   []LocalizeHypothesis // ranked, best first
+	Best, Second LocalizeHypothesis
+	ScoreMargin  float64 // best.Second score separation
+	AppliedEdge  int     // index of the relocation edge added (-1 if none)
+}
 
 // FrameDecision records what happened to a frame; it is what makes the
 // pipeline explainable.

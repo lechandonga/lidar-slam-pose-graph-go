@@ -210,6 +210,15 @@ func (g *Grid) castRay(x0, y0, x1, y1 float64, c Config) {
 		cy := int(math.Floor((y - g.oy) / g.res))
 		if cx >= 0 && cy >= 0 && cx < g.w && cy < g.h {
 			idx := cy*g.w + cx
+			// Cross-session stability: a cell already judged occupied is
+			// never erased by a later free-space ray (occlusion/shadows
+			// change between visits). Repeated sweeps therefore reinforce
+			// walls rather than smearing or deleting them.
+			if c.MapFreezeOccupied && g.logOdds[idx] > 0.4 {
+				x += ux
+				y += uy
+				continue
+			}
 			g.logOdds[idx] = math.Max(-c.MapLogOddMax,
 				math.Min(c.MapLogOddMax, g.logOdds[idx]+c.MapLogOddFree))
 		}

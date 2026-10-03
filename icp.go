@@ -182,7 +182,43 @@ func matchICP(cfg Config, ref []Point, scan []Point, start Pose) (pose2 Pose, sc
 	// References are already rasterized surfaces; thin them once more in
 	// case multiple keyframes overlap (duplicate cells are harmless to PCA).
 	ri := buildRefIndex(ref, cfg.MapResolution*1.5)
+	return matchICPWithIndex(cfg, ri, scan, start)
+}
+
+// icpCache holds the per-reference structures (spatial index + precomputed
+// PCA normals) reused across many global-localization seeds.
+type icpCache struct {
+	segMax float64
+	surf   []struct {
+		x, y, nx, ny float64
+		hasNormal    bool
+	}
+}
+
+func buildICPCache(cfg Config, ri *refIndex) *icpCache {
 	segMax := cfg.MapResolution * 3
+	c := &icpCache{segMax: segMax}
+	c.surf = make([]struct {
+		x, y, nx, ny float64
+		hasNormal    bool
+	}, len(ri.pts))
+	for idx := range ri.pts {
+		s := ri.segmentAt(idx, segMax)
+		c.surf[idx].x = s.p1.X
+		c.surf[idx].y = s.p1.Y
+		c.surf[idx].nx = s.nx
+		c.surf[idx].ny = s.ny
+		c.surf[idx].hasNormal = s.valid
+	}
+	return c
+}
+
+func matchICPWithIndex(cfg Config, ri *refIndex, scan []Point, start Pose) (Pose, float64, float64, int, [3]bool) {
+	return matchICPCached(cfg, ri, buildICPCache(cfg, ri), scan, start)
+}
+
+// matchICPCached is matchICP with caller-supplied reference normals.
+func matchICPCached(cfg Config, ri *refIndex, cache *icpCache, scan []Point, start Pose) (pose2 Pose, score2 float64, ratio2 float64, inlier2 int, weak [3]bool) {
 	pose := start
 	var H [3][3]float64
 	nCorr := 0
@@ -191,16 +227,6 @@ func matchICP(cfg Config, ref []Point, scan []Point, start Pose) (pose2 Pose, sc
 	// Precompute local surface normals once: PCA over the neighborhood is
 	// the most expensive step and the reference does not move between ICP
 	// iterations.
-	type surf struct {
-		x, y, nx, ny float64
-		hasNormal    bool
-	}
-	surfPts := make([]surf, len(ri.pts))
-	for idx := range ri.pts {
-		s := ri.segmentAt(idx, segMax)
-		surfPts[idx] = surf{x: s.p1.X, y: s.p1.Y,
-			nx: s.nx, ny: s.ny, hasNormal: s.valid}
-	}
 	for it := 0; it < cfg.RefineIter; it++ {
 		H = [3][3]float64{}
 		var g [3]float64
@@ -215,7 +241,7 @@ func matchICP(cfg Config, ref []Point, scan []Point, start Pose) (pose2 Pose, sc
 			if j < 0 {
 				continue
 			}
-			seg := surfPts[j]
+			seg := cache.surf[j]
 			var nx, ny, qx, qy float64
 			if seg.hasNormal {
 				nx, ny, qx, qy = seg.nx, seg.ny, seg.x, seg.y

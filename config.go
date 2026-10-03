@@ -73,6 +73,36 @@ type Config struct {
 	LoopMinScore      float64 // match score (mean field response) required
 	LoopStrongScore   float64
 
+	// --- Cross-session global localization ---
+	// LocalizeMinScore is the minimum fine alignment score (inlier fraction
+	// / likelihood response in [0,1]) for a start pose to be considered at
+	// all. LocalizeStrongScore is required for a unique, accepted fix.
+	LocalizeMinScore    float64
+	LocalizeStrongScore float64
+	// LocalizeAmbiguousMargin: when the best and second-best distinct
+	// hypotheses score within this margin, the fix is declared ambiguous.
+	LocalizeAmbiguousMargin float64
+	// LocalizeMaxRMS bounds the mean point-to-surface residual (metres) of
+	// an accepted fix; larger residuals are rejected as weak alignment.
+	LocalizeMaxRMS float64
+	// Global coarse search sampling (no hint: full 2*pi heading sweep over
+	// every previously mapped keyframe position).
+	LocalizeCoarseXY    float64
+	LocalizeCoarseTheta float64
+	// Default search windows around a user-supplied pose hint.
+	LocalizeHintXYWin float64
+	LocalizeHintThWin float64
+	// CompactDist*: cross-session keyframes whose FINALIZED poses coincide
+	// within these limits describe the same physical spot and are merged at
+	// save/Finalize time so repeated sessions do not accumulate duplicate
+	// nodes, edges or map cells.
+	CompactDistXY float64
+	CompactDistTh float64
+	// MapFreezeOccupied prevents rays from clearing a cell already
+	// classified occupied: re-observing a mapped wall can never erase it,
+	// which is what keeps repeated sweeps stable across sessions.
+	MapFreezeOccupied bool
+
 	// --- Pose graph optimization ---
 	OptMaxIter       int
 	OptConvergeDelta float64 // max |dx| between iterations
@@ -142,6 +172,18 @@ func DefaultConfig() Config {
 		LoopOdomMaxDiffTh:  0.3,
 		LoopMinScore:       0.45,
 		LoopStrongScore:    0.75,
+
+		LocalizeMinScore:        0.55,
+		LocalizeStrongScore:     0.78,
+		LocalizeAmbiguousMargin: 0.08,
+		LocalizeMaxRMS:          0.12,
+		LocalizeCoarseXY:        0.5,
+		LocalizeCoarseTheta:     0.20,
+		LocalizeHintXYWin:       1.5,
+		LocalizeHintThWin:       0.6,
+		CompactDistXY:           0.25,
+		CompactDistTh:           0.15,
+		MapFreezeOccupied:       true,
 
 		OptMaxIter:       30,
 		OptConvergeDelta: 1e-4,
