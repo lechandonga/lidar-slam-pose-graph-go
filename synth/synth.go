@@ -29,6 +29,14 @@ type Options struct {
 	// Path, when non-nil, overrides Waypoints and supplies explicit
 	// ground-truth poses (used for turn/loop scenarios).
 	Path []Pose
+	// ScanPath, when non-nil, supplies the poses at which laser scans are
+	// ray-cast, while Path keeps supplying the poses wheel odometry is
+	// integrated along. The two are the same length. This is required for a
+	// session re-expressed in its own local frame: its odometry starts at
+	// the local origin (Path), but its scans observe the SAME physical
+	// world, so they must be cast at the world poses (ScanPath). When nil,
+	// scans are cast at Path (the usual single-session case).
+	ScanPath []Pose
 	// Heading: 0 means align heading with travel direction; otherwise the
 	// final heading is held (used for the turn scenario where heading
 	// explicitly rotates in place — encode with duplicate waypoints).
@@ -108,6 +116,7 @@ type Generator struct {
 
 type generatedPath struct {
 	poses []Pose
+	scan  []Pose
 	times []float64
 }
 
@@ -142,7 +151,11 @@ func (g *Generator) buildPath() generatedPath {
 			poses = append(poses, ps)
 			times = append(times, float64(i)*g.opt.DT)
 		}
-		return generatedPath{poses: poses, times: times}
+		scan := poses
+		if len(g.opt.ScanPath) == len(g.opt.Path) {
+			scan = g.opt.ScanPath
+		}
+		return generatedPath{poses: poses, scan: scan, times: times}
 	}
 	t := 0.0
 	for i := 0; i+1 < len(g.opt.Waypoints); i++ {
@@ -168,7 +181,7 @@ func (g *Generator) buildPath() generatedPath {
 			times = append(times, t)
 		}
 	}
-	return generatedPath{poses: poses, times: times}
+	return generatedPath{poses: poses, scan: poses, times: times}
 }
 
 func (g *Generator) buildFrames(path generatedPath) {
@@ -190,7 +203,11 @@ func (g *Generator) buildFrames(path generatedPath) {
 		odom = compose(odom, Pose{X: scaledX, Y: localY, Theta: biasedTh})
 		prev = gt
 
-		pts := g.castScan(gt)
+		scanAt := gt
+		if i < len(path.scan) {
+			scanAt = path.scan[i]
+		}
+		pts := g.castScan(scanAt)
 		// Apply range/bearing noise.
 		for j := range pts {
 			if g.opt.BeamNoise > 0 {

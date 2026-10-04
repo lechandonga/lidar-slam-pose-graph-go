@@ -53,6 +53,15 @@ type Pipeline struct {
 	// not touch anything until BeginSession commits a localization result.
 	awaitAnchor bool
 
+	// sessionStartNodes/sessionStartTraj record the graph/trajectory sizes
+	// when the current session began. A session that adds NO new keyframes
+	// re-swept only already-mapped terrain; after Finalize its duplicate
+	// trajectory segment is dropped so repeated load/run/save over the same
+	// area converges to the single-session trajectory instead of stacking
+	// physically identical copies round after round.
+	sessionStartNodes int
+	sessionStartTraj  int
+
 	decisions      []FrameDecision
 	loopLog        []LoopDecision
 	optLog         []OptLogEntry
@@ -286,6 +295,9 @@ func (p *Pipeline) decide(fr Frame, o Outcome, reason, detail string) FrameDecis
 	d := FrameDecision{FrameID: fr.Scan.ID, Time: fr.Scan.Time,
 		Outcome: o, Reason: reason, Detail: detail}
 	p.decisions = append(p.decisions, d)
+	if m := p.cfg.MaxDecisionLog; m > 0 && len(p.decisions) > m {
+		p.decisions = p.decisions[len(p.decisions)-m:]
+	}
 	return d
 }
 
@@ -359,7 +371,13 @@ func (p *Pipeline) advanceFused(fr Frame, clean []Point,
 	if clean != nil {
 		kf := p.maybeKeyframe(fr, clean, pose,
 			Between(p.odomBase, fr.Odom.Pose))
-		if kf >= 0 {
+		if kf < -1 {
+			// Revisit of an existing keyframe: reuse its node, do NOT add
+			// a duplicate and do NOT integrate the scan again (that would
+			// only re-accumulate evidence and bloat the saved grid).
+			p.lastKF = -kf - 2
+			p.lastKFOdom = Between(p.odomBase, fr.Odom.Pose)
+		} else if kf >= 0 {
 			p.grid.integrateScanLocked(p.graph.Nodes[kf].Pose,
 				p.graph.Nodes[kf].Scan)
 			if kf%p.cfg.LoopCheckEvery == 0 {

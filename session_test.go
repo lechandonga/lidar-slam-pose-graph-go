@@ -523,12 +523,10 @@ func TestOldStateRejected(t *testing.T) {
 		t.Logf("dangling: %v", err)
 	}
 
-	// A genuine v1 file must load via forward migration.
-	v1 := filepath.Join(dir, "v1.gob")
-	if err := root.ExportWriteV1State(v1); err != nil {
-		t.Fatal(err)
-	}
-	pv1, err := root.LoadState(v1, root.NopLogger())
+	// A genuine v1 file (produced by the real previous build, checked in
+	// under testdata) must load via forward migration.
+	pv1, err := root.LoadState(
+		filepath.Join("testdata", "legacy-v1.gob"), root.NopLogger())
 	if err != nil {
 		t.Fatalf("v1 state must migrate and load: %v", err)
 	}

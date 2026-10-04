@@ -59,6 +59,13 @@ func runSplitDemo(outDir string, seed int64) {
 	fmt.Printf("\n=== cross-session localization ===\n")
 	fmt.Printf("status=%s reason=%s score=%.3f residual=%.3f pose=%s candidates=%d\n",
 		lr.Status, lr.Reason, lr.Score, lr.Residual, lr.Pose, len(lr.Candidates))
+	if lr.Status == root.LocalizeUnique {
+		errXY := math.Hypot(lr.Pose.X-sessB.StartWorld.X,
+			lr.Pose.Y-sessB.StartWorld.Y)
+		errTh := math.Abs(lr.Pose.Theta - sessB.StartWorld.Theta)
+		fmt.Printf("annotated start=%v anchor error: dXY=%.3fm dTheta=%.4frad\n",
+			sessB.StartWorld, errXY, errTh)
+	}
 	if lr.Status != root.LocalizeUnique {
 		fmt.Printf("refusing to anchor (%s); old map left unchanged\n", lr.Status)
 		return

@@ -85,6 +85,9 @@ CGO_ENABLED=1 go test -race -run TestConcurrentMapQueries .
 - 帧时间从 0 开始；
 - 两段使用相互独立的噪声种子（由 `opt.Seed` 派生），模拟真实的不同上电
   周期；
+- 扫描在**公共世界的真值位姿**上投射（生成器内部 `ScanPath`=世界路径、
+  `Path`=局部路径）：激光看到的是物理世界，不能在平移后的局部坐标里对
+  世界地图投射，否则扫描与该段标注的 `StartWorld` 不自洽；
 - 同时返回每段在公共世界系的真值 `TruthWorld` 和第二段起点 `StartWorld`，
   供评估全局定位误差。
 

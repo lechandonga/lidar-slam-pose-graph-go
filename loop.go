@@ -209,6 +209,7 @@ func (p *Pipeline) addCrossSessionEdgeLocked(k int, cd loopCandidate) {
 		Reason: "cross_session_revisit",
 	}
 	p.loopLog = append(p.loopLog, dec)
+	p.trimLoopLogLocked()
 	p.log.Loopf("kf=%d -> %d CROSS-SESSION score=%.2f measure=%s",
 		k, cd.j, cd.score, worldMeasure)
 }
@@ -221,8 +222,15 @@ func (p *Pipeline) logLoop(k int, cd loopCandidate, status LoopStatus,
 		Status: status, WeightScale: scale, Reason: reason,
 	}
 	p.loopLog = append(p.loopLog, dec)
+	p.trimLoopLogLocked()
 	p.log.Loopf("kf=%d -> %d status=%s score=%.2f chi2=%.1f scale=%.2f %s",
 		k, cd.j, status, cd.score, chi2, scale, reason)
+}
+
+func (p *Pipeline) trimLoopLogLocked() {
+	if m := p.cfg.MaxLoopLog; m > 0 && len(p.loopLog) > m {
+		p.loopLog = p.loopLog[len(p.loopLog)-m:]
+	}
 }
 
 func scaleInfo(in [3][3]float64, s float64) [3][3]float64 {
@@ -277,6 +285,9 @@ func (p *Pipeline) runOptimizeLocked(why string) OptimizeResult {
 		Iterations: r.Iterations, Converged: r.Converged,
 		FinalDelta: r.FinalDelta, CostBefore: before, CostAfter: after,
 	})
+	if m := p.cfg.MaxOptLog; m > 0 && len(p.optLog) > m {
+		p.optLog = p.optLog[len(p.optLog)-m:]
+	}
 	p.log.Optf("%s nodes=%d edges=%d iters=%d converged=%v cost %.3f -> %.3f",
 		why, len(p.graph.Nodes), len(p.graph.Edges),
 		r.Iterations, r.Converged, before, after)
@@ -340,6 +351,14 @@ func (p *Pipeline) retargetTrajectoryLocked(prevPoses []Pose) {
 func (p *Pipeline) Finalize() OptimizeResult {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// A session that added no keyframes only re-swept existing terrain.
+	// Its trajectory segment is physically identical to one already stored,
+	// so drop it before persisting: repeated load/run/save over an
+	// unchanged area then keeps the exact single-merge trajectory.
+	if p.session > 0 && len(p.graph.Nodes) == p.sessionStartNodes &&
+		len(p.traj) > p.sessionStartTraj {
+		p.traj = p.traj[:p.sessionStartTraj]
+	}
 	r := p.runOptimizeLocked("final")
 	if p.lastOptMaxMove > p.cfg.OptConvergeDelta {
 		p.grid.rebuildFromKeyframes(p.graph.Nodes)

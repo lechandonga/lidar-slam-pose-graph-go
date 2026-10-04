@@ -58,6 +58,12 @@ func SplitSessions(world World, path []Pose, opt Options, cut1, cut2 int) (
 			truthWorld[i] = ps
 		}
 		o.Path = local
+		// Scans observe the physical world: cast them at the original
+		// WORLD poses while odometry integrates along the re-expressed
+		// local path. Casting at local poses would ray-trace the world
+		// walls from positions the robot never occupied, producing scans
+		// that do not correspond to the annotated StartWorld.
+		o.ScanPath = seg
 		g := New(world, o)
 		ss := SplitSession{StartWorld: origin, TruthWorld: truthWorld}
 		for i := 0; i < g.Len(); i++ {

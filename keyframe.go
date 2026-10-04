@@ -6,6 +6,15 @@ func (p *Pipeline) maybeKeyframe(fr Frame, clean []Point, pose, odomPose Pose) i
 	if p.lastKF < 0 {
 		return p.addKeyframeLocked(fr, clean, pose, odomPose)
 	}
+	// Revisit suppression: if the candidate pose coincides with an
+	// already stored keyframe other than the odom-chain predecessor, reuse
+	// that node instead of adding a duplicate. Repeatedly loading and
+	// re-sweeping the SAME area then converges to a fixed graph/state
+	// size, while genuinely new terrain (farther than the threshold from
+	// every existing node) keeps adding keyframes.
+	if dup := p.findRevisitKeyframeLocked(pose, p.lastKF); dup >= 0 {
+		return -dup - 2
+	}
 	prev := p.graph.Nodes[p.lastKF]
 	d := PoseDist(prev.Pose, pose)
 	dt := math.Abs(normAngle(pose.Theta - prev.Pose.Theta))
@@ -14,6 +23,26 @@ func (p *Pipeline) maybeKeyframe(fr Frame, clean []Point, pose, odomPose Pose) i
 		return -1
 	}
 	return p.addKeyframeLocked(fr, clean, pose, odomPose)
+}
+
+// findRevisitKeyframeLocked returns the index of an existing keyframe whose
+// optimized pose is within the revisit-suppression radius of pose, or -1.
+// skip is the odom-chain predecessor, which is excluded: two consecutive
+// keyframes in a fresh session are naturally spaced roughly one keyframe
+// interval apart and must not suppress each other.
+func (p *Pipeline) findRevisitKeyframeLocked(pose Pose, skip int) int {
+	dxy := p.cfg.RevisitSuppressionXY
+	dth := p.cfg.RevisitSuppressionTheta
+	for i, kf := range p.graph.Nodes {
+		if i == skip {
+			continue
+		}
+		if PoseDist(kf.Pose, pose) <= dxy &&
+			math.Abs(normAngle(kf.Pose.Theta-pose.Theta)) <= dth {
+			return i
+		}
+	}
+	return -1
 }
 
 func (p *Pipeline) addKeyframeLocked(fr Frame, clean []Point, pose, odomPose Pose) int {

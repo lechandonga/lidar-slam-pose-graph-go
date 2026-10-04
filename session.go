@@ -3,7 +3,10 @@
 // world frame.
 package slam
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // PrepareNewSession arms a loaded pipeline for a brand-new independent
 // session (separate power cycle, own odom/clock origin). After this call
@@ -79,6 +82,8 @@ func (p *Pipeline) BeginSession(fr Frame, lr LocalizeResult) error {
 	// is set so stored ID = sourceID + frameIDBase with frameIDBase=maxID+1.
 	p.frameIDBase = maxID + 1
 	p.awaitAnchor = false
+	p.sessionStartNodes = len(p.graph.Nodes)
+	p.sessionStartTraj = len(p.traj)
 
 	pose := lr.Pose
 	p.lastPose = pose
@@ -88,13 +93,23 @@ func (p *Pipeline) BeginSession(fr Frame, lr LocalizeResult) error {
 	p.started = true
 	p.lastScan = append(p.lastScan[:0], clean...)
 
-	idx := p.addSessionKeyframeLocked(fr, clean, pose, Pose{})
-	p.grid.integrateScanLocked(pose, clean)
+	idx, newNode := p.addSessionKeyframeLocked(fr, clean, pose, Pose{})
+	// Only a genuinely new anchor keyframe contributes a fresh scan to the
+	// grid; a reused (revisit) node's cells are already mapped.
+	if newNode {
+		p.grid.integrateScanLocked(pose, clean)
+	}
 	p.traj = append(p.traj, TrajectoryPoint{
 		FrameID: fr.Scan.ID + p.frameIDBase,
 		Time:    fr.Scan.Time, Pose: pose,
 	})
-	p.addAnchorEdgesLocked(idx, lr)
+	// Anchor edges tie a NEW session node into the old graph. When the
+	// anchor reused an existing node it is already part of the old graph
+	// and needs no extra constraints (adding them every round would grow
+	// the edge set and the state file for an unchanged area).
+	if newNode {
+		p.addAnchorEdgesLocked(idx, lr)
+	}
 
 	p.frameCount++
 	d := p.decide(Frame{
@@ -138,11 +153,30 @@ func (p *Pipeline) SessionInfo() (session int, frameIDBase int64) {
 // No odom-chain edge is created to the previous keyframe: sessions have
 // unrelated odom frames, and their connection is expressed exclusively by
 // anchor/cross-session loop edges.
-func (p *Pipeline) addSessionKeyframeLocked(fr Frame, clean []Point, pose, odomPose Pose) int {
-	idx := len(p.graph.Nodes)
+func (p *Pipeline) addSessionKeyframeLocked(fr Frame, clean []Point, pose, odomPose Pose) (int, bool) {
 	scan := subsample(clean, p.cfg.MaxScanPointsKF)
 	surfaceScan := subsample(clean, 360)
 	surface := rasterizeHits(transformAll(pose, surfaceScan), p.cfg.MapResolution)
+	// Reuse a pre-existing keyframe when the new session boots at an
+	// already mapped pose (repeated load -> run overlap -> save). This is
+	// the session-start counterpart of maybeKeyframe's revisit suppression
+	// and is what makes repeated rounds converge to a fixed graph size.
+	for i, kf := range p.graph.Nodes {
+		if kf.Session == p.session {
+			continue
+		}
+		if PoseDist(kf.Pose, pose) <= p.cfg.RevisitSuppressionXY &&
+			math.Abs(normAngle(kf.Pose.Theta-pose.Theta)) <=
+				p.cfg.RevisitSuppressionTheta {
+			// The reused node now carries the new session's chain: retag
+			// it so subsequent frames build odom edges onto it normally.
+			kf.Session = p.session
+			p.lastKF = i
+			p.lastKFOdom = odomPose
+			return i, false
+		}
+	}
+	idx := len(p.graph.Nodes)
 	kf := &Keyframe{
 		ID:      idx,
 		FrameID: fr.Scan.ID + p.frameIDBase,
@@ -154,7 +188,7 @@ func (p *Pipeline) addSessionKeyframeLocked(fr Frame, clean []Point, pose, odomP
 	p.graph.Nodes = append(p.graph.Nodes, kf)
 	p.lastKF = idx
 	p.lastKFOdom = odomPose
-	return idx
+	return idx, true
 }
 
 // addAnchorEdgesLocked links the new session's first keyframe to up to

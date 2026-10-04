@@ -75,10 +75,18 @@ margin 的候选；其余为 `failed`（见 `docs/multi-session.md`）。
 | `KeyframeMinDist/MinTheta` | 0.3 m / 0.15 rad | 新建关键帧的位移/转角阈值 |
 | `KeyframeMaxGap` | 2.0 m | 触发关键帧的兜底间隔 |
 | `MaxScanPointsKF` | 360 | 每关键帧扫描点数上限（内存有界） |
+| `RevisitSuppressionXY/Theta` | 0.40 m / 0.30 rad | 新关键帧与已有非前驱节点重合时复用该节点（重复扫同区不膨胀） |
 | `refRadius`（代码常量） | 4 m | 局部匹配参考范围 |
 
 关键帧保存稠密栅格化表面（命中单元去重），扫描等距降采样，内存随时间
 线性且有上限，不会无界增长。
+
+## 诊断日志与持久化
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `PersistLogs` | false | 决策/回环/优化日志是否写入状态文件（恢复续跑不需要；关闭后重复存档大小稳定） |
+| `MaxDecisionLog/MaxLoopLog/MaxOptLog` | 500 / 300 / 200 | 内存（及开启持久化后的盘上）日志环形上限 |
 
 ## 回环
 

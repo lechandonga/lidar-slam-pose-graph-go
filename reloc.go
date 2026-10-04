@@ -371,21 +371,23 @@ func relocWeightedScore(f *likelihoodField, p Pose, scan []Point) (float64, int)
 		// Near points (<2 m) count up to 6x; far points (>12 m) ~1x.
 		w := 1.0 + 10.0/(r+1.0)
 		wp := p.Transform(pt)
+		// Every scan point votes over the FULL weight: a point that lands
+		// far from every mapped surface (or outside the mapped area)
+		// contributes ZERO support, not a free full mark. Counting such
+		// points as matches let a translated/rotated hypothesis in a
+		// wall-rich room collect a near-perfect score from the points that
+		// happened to rest near unrelated walls.
+		wsum += w
+		n++
 		cx, cy := f.cell(wp.X, wp.Y)
 		if cx < 0 || cy < 0 || cx >= f.w || cy >= f.h {
-			wsum += w
-			n++
 			continue
 		}
 		d := f.dist[cy*f.w+cx]
 		if d > 3*f.inflate {
-			wsum += w
-			n++
 			continue
 		}
 		ssum += w * math.Exp(-(d*d)/(2*f.sigma2))
-		wsum += w
-		n++
 	}
 	if n == 0 || wsum == 0 {
 		return 0, 0

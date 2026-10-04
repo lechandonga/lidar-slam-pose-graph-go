@@ -1,6 +1,7 @@
 package slam
 
 import (
+	"bytes"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -23,6 +24,87 @@ const (
 	stateVersionV1  = 1
 	minStateVersion = 1
 )
+
+// keyframeWireV1 is the EXACT gob wire type the v1 build wrote for every
+// Keyframe (v1 used a custom GobEncode because surfaceBase was unexported).
+// A v2 decoder cannot feed those bytes straight into the current Keyframe
+// type (gob rejects the mismatched field layout with "wrong type", which
+// older builds surfaced misleadingly as a corrupt file). We decode v1
+// nodes into this type first, then migrate field-by-field.
+type keyframeWireV1 struct {
+	ID                          int
+	FrameID                     int64
+	Time                        float64
+	Pose, PoseOdom, SurfaceBase Pose
+	Scan, Surface               []Point
+	UpdatedAt                   int64
+}
+
+// keyframeWireV2 is the current explicit on-disk layout for a Keyframe.
+type keyframeWireV2 struct {
+	ID             int
+	FrameID        int64
+	Time           float64
+	Pose, PoseOdom Pose
+	Session        int
+	Scan           []Point
+	SurfaceBase    Pose
+	Surface        []Point
+	UpdatedAt      int64
+}
+
+func init() {
+	// v1 encoded each Keyframe via a custom GobEncode that emitted a value
+	// whose self-described gob type name is "keyframeGob". Register the
+	// historical field layout under exactly that name so Keyframe.GobDecode
+	// can parse v1 bytes by interface type.
+	gob.RegisterName("keyframeGob", (*keyframeWireV1)(nil))
+}
+
+// GobEncode writes the current Keyframe layout explicitly.
+func (k *Keyframe) GobEncode() ([]byte, error) {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(keyframeWireV2{
+		ID: k.ID, FrameID: k.FrameID, Time: k.Time,
+		Pose: k.Pose, PoseOdom: k.PoseOdom, Session: k.Session,
+		Scan: k.Scan, SurfaceBase: k.SurfaceBase, Surface: k.Surface,
+		UpdatedAt: k.UpdatedAt,
+	}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// GobDecode accepts both the current layout (keyframeWireV2) and the v1
+// "keyframeGob" layout (no Session field). Gob fills fields by name, so the
+// historical bytes decode cleanly into the wire struct; Session defaults to
+// 0 which is exactly the v1 semantics (everything was session 0).
+func (k *Keyframe) GobDecode(data []byte) error {
+	var wv2 keyframeWireV2
+	dec := gob.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&wv2); err != nil {
+		// Fall back to the v1 "keyframeGob" layout.
+		var old any = &keyframeWireV1{}
+		if err2 := gob.NewDecoder(bytes.NewReader(data)).Decode(&old); err2 != nil {
+			return err
+		}
+		w := old.(*keyframeWireV1)
+		*k = Keyframe{
+			ID: w.ID, FrameID: w.FrameID, Time: w.Time,
+			Pose: w.Pose, PoseOdom: w.PoseOdom, Session: 0,
+			Scan: w.Scan, SurfaceBase: w.SurfaceBase, Surface: w.Surface,
+			UpdatedAt: w.UpdatedAt,
+		}
+		return nil
+	}
+	*k = Keyframe{
+		ID: wv2.ID, FrameID: wv2.FrameID, Time: wv2.Time,
+		Pose: wv2.Pose, PoseOdom: wv2.PoseOdom, Session: wv2.Session,
+		Scan: wv2.Scan, SurfaceBase: wv2.SurfaceBase, Surface: wv2.Surface,
+		UpdatedAt: wv2.UpdatedAt,
+	}
+	return nil
+}
 
 // savedState is the complete resumable state. Everything needed to continue
 // a run identically is captured here.
@@ -81,6 +163,14 @@ func (p *Pipeline) snapshotStateLocked() savedState {
 		GridW: gw, GridH: gh, GridValues: vals,
 		Session: p.session, FrameIDBase: p.frameIDBase,
 		AwaitAnchor: p.awaitAnchor,
+	}
+	if !p.cfg.PersistLogs {
+		// Diagnostic telemetry is not needed to resume; leave it out so a
+		// convergent graph re-saved over the same area produces a stable
+		// file. In-memory queries are unaffected.
+		st.Decisions = nil
+		st.LoopLog = nil
+		st.OptLog = nil
 	}
 	return st
 }
@@ -161,25 +251,70 @@ func writeGobAtomic(path string, v any) (err error) {
 
 // LoadState reads a snapshot saved by Save.
 func LoadState(path string, logger Logger) (*Pipeline, error) {
-	f, err := os.Open(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	var st savedState
-	dec := gob.NewDecoder(f)
-	if err := dec.Decode(&st); err != nil {
+	// Peek the version before committing to a wire layout: v1 wrote nodes
+	// with a different Keyframe gob type, so decoding must be layout-aware.
+	var head struct{ Version int }
+	if err := gob.NewDecoder(bytes.NewReader(raw)).Decode(&head); err != nil {
 		return nil, fmt.Errorf("slam: state file truncated or corrupt: %w", err)
 	}
-	switch st.Version {
-	case stateVersionV1:
-		migrateV1ToV2(&st)
+	switch head.Version {
 	case stateVersion:
-		// current layout
+		var st savedState
+		if err := gob.NewDecoder(bytes.NewReader(raw)).Decode(&st); err != nil {
+			return nil, fmt.Errorf("slam: state file truncated or corrupt: %w", err)
+		}
+		return finalizeLoad(st, logger)
+	case stateVersionV1:
+		return loadV1Layout(raw, logger)
 	default:
 		return nil, fmt.Errorf("%w: got %d, this build supports versions %d..%d",
-			ErrUnsupportedState, st.Version, minStateVersion, stateVersion)
+			ErrUnsupportedState, head.Version, minStateVersion, stateVersion)
 	}
+}
+
+// savedStateV1Wire mirrors the v1 on-disk layout, including the v1 custom
+// Keyframe wire type.
+type savedStateV1Wire struct {
+	Version    int
+	Config     Config
+	Nodes      []*Keyframe
+	Edges      []*Edge
+	Traj       []TrajectoryPoint
+	FrameCount int64
+	LastPose   Pose
+	LastOdom   Pose
+	Started    bool
+	LastKF     int
+	LastKFOdom Pose
+	LastScan   []Point
+	Decisions  []FrameDecision
+	LoopLog    []LoopDecision
+	OptLog     []OptLogEntry
+	GridRes    float64
+	GridOX     float64
+	GridOY     float64
+	GridW      int
+	GridH      int
+	GridValues []float64
+}
+
+func loadV1Layout(raw []byte, logger Logger) (*Pipeline, error) {
+	var v1 savedStateV1Wire
+	if err := gob.NewDecoder(bytes.NewReader(raw)).Decode(&v1); err != nil {
+		// A v1-labelled file that does not even parse as the v1 layout is
+		// genuinely corrupt (partial write / wrong file), distinct from an
+		// unsupported version.
+		return nil, fmt.Errorf("slam: v1 state file truncated or corrupt: %w", err)
+	}
+	st := migrateV1WireToV2(v1)
+	return finalizeLoad(st, logger)
+}
+
+func finalizeLoad(st savedState, logger Logger) (*Pipeline, error) {
 	// A constructible pipeline is created only after full validation, so a
 	// malformed file can never produce a half-new/half-old pipeline.
 	if err := st.validate(); err != nil {
@@ -193,18 +328,36 @@ func LoadState(path string, logger Logger) (*Pipeline, error) {
 	return p, nil
 }
 
-// migrateV1ToV2 fills fields introduced in v2. All v1 keyframes belong to
-// session 0; frame IDs were already globally unique in v1 because there was
-// only one session.
-func migrateV1ToV2(st *savedState) {
-	for _, kf := range st.Nodes {
-		if kf.Session == 0 {
-			kf.Session = 0
+func migrateV1WireToV2(v1 savedStateV1Wire) savedState {
+	nodes := make([]*Keyframe, 0, len(v1.Nodes))
+	for _, k := range v1.Nodes {
+		if k == nil {
+			continue
 		}
+		nodes = append(nodes, &Keyframe{
+			ID: k.ID, FrameID: k.FrameID, Time: k.Time,
+			Pose: k.Pose, PoseOdom: k.PoseOdom,
+			// All v1 keyframes belong to session 0; SurfaceBase is
+			// restored from the v1 custom wire field.
+			Session:     0,
+			Scan:        k.Scan,
+			SurfaceBase: k.SurfaceBase,
+			Surface:     k.Surface,
+			UpdatedAt:   k.UpdatedAt,
+		})
 	}
-	st.Session = 0
-	st.FrameIDBase = 0
-	st.Version = stateVersion
+	return savedState{
+		Version: stateVersion, Config: v1.Config,
+		Nodes: nodes, Edges: v1.Edges, Traj: v1.Traj,
+		FrameCount: v1.FrameCount,
+		LastPose:   v1.LastPose, LastOdom: v1.LastOdom,
+		Started: v1.Started, LastKF: v1.LastKF,
+		LastKFOdom: v1.LastKFOdom, LastScan: v1.LastScan,
+		Decisions: v1.Decisions, LoopLog: v1.LoopLog, OptLog: v1.OptLog,
+		GridRes: v1.GridRes, GridOX: v1.GridOX, GridOY: v1.GridOY,
+		GridW: v1.GridW, GridH: v1.GridH, GridValues: v1.GridValues,
+		Session: 0, FrameIDBase: 0, AwaitAnchor: false,
+	}
 }
 
 // validate checks the structural integrity of a decoded state. Any error

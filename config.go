@@ -51,6 +51,15 @@ type Config struct {
 	MaxScanPointsKF  int     // subsample cap per keyframe (bounded memory)
 	OdomEdgeSigmaXY  float64
 	OdomEdgeSigmaTh  float64
+	// RevisitSuppressionXY/Theta: when a new keyframe candidate lands this
+	// close to an EXISTING keyframe (other than the immediate odom-chain
+	// predecessor), the existing node is reused instead of adding a new
+	// one. This keeps re-sweeping an already mapped area (load -> run a
+	// short overlap leg -> save, repeated) from growing the graph and the
+	// state file round after round. Genuinely new terrain stays farther
+	// than this and adds nodes normally.
+	RevisitSuppressionXY    float64
+	RevisitSuppressionTheta float64
 
 	// --- Loop closure ---
 	LoopSearchRadius float64 // metres, candidate keyframes within this
@@ -126,6 +135,22 @@ type Config struct {
 	// --- Runtime ---
 	OptEveryNKeyframes int // incremental optimization cadence
 	RNGSeed            int64
+	// MaxDecisionLog / MaxLoopLog / MaxOptLog bound how many per-frame
+	// decision, loop-attempt and optimization log entries are retained
+	// (newest kept). The logs are diagnostic and must not make a repeatedly
+	// saved/loaded state grow without bound when the graph itself has
+	// converged. 0 keeps every entry (used only if an embedder opts in).
+	MaxDecisionLog int
+	MaxLoopLog     int
+	MaxOptLog      int
+	// PersistLogs controls whether diagnostic logs (per-frame decisions,
+	// loop attempts, optimization trace) are written into the state file.
+	// They are NOT required to resume a run (the graph/trajectory/grid
+	// are), so they default to off: keeping them off is what lets a
+	// repeatedly loaded/re-swept/saved state over an unchanged area have a
+	// byte-stable file once the graph itself has converged. In-process,
+	// Decisions()/LoopDecisions()/OptLog() remain fully populated.
+	PersistLogs bool
 }
 
 // DefaultConfig returns validated defaults for a small indoor platform.
@@ -160,12 +185,14 @@ func DefaultConfig() Config {
 		RestartJumpXY:            1.0,
 		RestartJumpTheta:         1.0,
 
-		KeyframeMinDist:  0.3,
-		KeyframeMinTheta: 0.15,
-		KeyframeMaxGap:   2.0,
-		MaxScanPointsKF:  360,
-		OdomEdgeSigmaXY:  0.05,
-		OdomEdgeSigmaTh:  0.04,
+		KeyframeMinDist:         0.3,
+		KeyframeMinTheta:        0.15,
+		KeyframeMaxGap:          2.0,
+		MaxScanPointsKF:         360,
+		OdomEdgeSigmaXY:         0.05,
+		OdomEdgeSigmaTh:         0.04,
+		RevisitSuppressionXY:    0.40,
+		RevisitSuppressionTheta: 0.30,
 
 		LoopSearchRadius:   1.2,
 		LoopOdomRadius:     1.2,
@@ -211,6 +238,10 @@ func DefaultConfig() Config {
 
 		OptEveryNKeyframes: 5,
 		RNGSeed:            1,
+		MaxDecisionLog:     500,
+		MaxLoopLog:         300,
+		MaxOptLog:          200,
+		PersistLogs:        false,
 	}
 }
 
