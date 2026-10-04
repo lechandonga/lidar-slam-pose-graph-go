@@ -41,28 +41,41 @@ func SplitSessions(world World, path []Pose, opt Options, cut1, cut2 int) (
 		cut1 = len(path)
 	}
 	build := func(seg []Pose, seed int64, origin Pose) SplitSession {
-		o := opt
-		o.Seed = seed
-		// Re-express poses in the segment-local frame: translate and rotate
-		// so the first pose is (0,0,0); scans/odom generated from this path
-		// are then exactly what a freshly booted robot at origin sees.
+		// A freshly powered-on robot at `origin` sees scans cast at the
+		// WORLD poses seg[i] (beam geometry depends on where the robot is
+		// in the world), while its wheel odometry integrates motion in the
+		// session-LOCAL frame whose first pose is (0,0,0). These are two
+		// different frames and must be generated separately: casting scans
+		// from the local path would make the first scan depict the world as
+		// seen from world (0,0,0), contradicting StartWorld and yielding a
+		// high-scoring localization at the WRONG place.
 		local := make([]Pose, len(seg))
 		inv := invert(origin)
 		truthWorld := make([]Pose, len(seg))
 		for i, ps := range seg {
-			// Full SE2 re-expression inv*p: translate to the origin AND
-			// rotate so the session starts heading 0 in its own frame. The
-			// generator's odometry is integrated in this local frame, so
-			// the rotation is mandatory, not just the translation.
-			local[i] = compose(inv, ps)
+			local[i] = compose(inv, ps) // full SE2 re-expression
 			truthWorld[i] = ps
 		}
-		o.Path = local
-		g := New(world, o)
+		oScan := opt
+		oScan.Seed = seed
+		oScan.Path = seg // WORLD poses: correct scan geometry
+		gScan := New(world, oScan)
+		oOdom := opt
+		oOdom.Seed = seed + 100003
+		oOdom.Path = local // LOCAL poses: zero-origin odom chain
+		gOdom := New(world, oOdom)
 		ss := SplitSession{StartWorld: origin, TruthWorld: truthWorld}
-		for i := 0; i < g.Len(); i++ {
-			st := g.At(i)
-			// Re-zero times per session: Generator already numbers from 0.
+		for i := 0; i < gScan.Len(); i++ {
+			stS := gScan.At(i)
+			stO := gOdom.At(i)
+			// World-cast scan geometry, session-local odometry. Times are
+			// re-zeroed per session (both generators number from 0).
+			st := Step{
+				ID: stS.ID, Time: stS.Time, Pose: stS.Pose,
+				Points: stS.Points,
+				Odom:   Pose{X: stO.Odom.X, Y: stO.Odom.Y, Theta: stO.Odom.Theta},
+				OdomOK: stO.OdomOK, Restart: stS.Restart,
+			}
 			ss.Frames = append(ss.Frames, st)
 		}
 		return ss

@@ -35,6 +35,9 @@ func ExportAddEdge(g *Graph, kind EdgeKind, i, j int, measure Pose,
 // ExportNodes returns the graph's nodes.
 func ExportNodes(g *Graph) []*Keyframe { return g.Nodes }
 
+// ExportConfig exposes the pipeline config (test diagnostics).
+func ExportConfig(p *Pipeline) Config { return p.cfg }
+
 // ExportOptimize runs the pose-graph optimizer.
 func ExportOptimize(g *Graph, cfg Config) OptimizeResult {
 	return optimizeGraph(g, cfg)

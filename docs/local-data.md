@@ -81,12 +81,30 @@ CGO_ENABLED=1 go test -race -run TestConcurrentMapQueries .
 `synth.SplitSessions(world, path, opt, cut1, cut2)` 把一条完整轨迹切成两段
 （`cut2 < cut1` 时两段有重叠），并让每段都成为**独立的一次开机**：
 
-- 每段扫描和里程计都以自己的起点为原点重新表达（里程计从 0 积分）；
+- 扫描在**公共世界系**按各帧真实位姿投线，里程计在**段内局部系**
+  （首帧 0,0,0）积分，二者分别生成、独立噪声种子；
 - 帧时间从 0 开始；
 - 两段使用相互独立的噪声种子（由 `opt.Seed` 派生），模拟真实的不同上电
   周期；
 - 同时返回每段在公共世界系的真值 `TruthWorld` 和第二段起点 `StartWorld`，
   供评估全局定位误差。
+
+因此每段都**自洽**：把某段自己的首帧拿去在「只含另一段的地图」里全局
+定位，唯一解应当落在这段自己标注的 `StartWorld` 上（不是另一段的
+起点）。验证方式：
+
+1. 只跑 A 段、存档；`LoadState → PrepareNewSession`；
+2. 用 B 段首帧 `Localize`，断言 `status=unique` 且
+   `hypot(pose.X-StartWorld.X, pose.Y-StartWorld.Y)` 很小（噪声默认下
+   约 0.1 m）、航向差约 0.01 rad；
+3. `BeginSession` 后跑完 B、`Finalize`，得到合并轨迹/地图；
+4. 另起一次，用**同一条完整 path** 单次跑完作为基准；比较
+   - B 段轨迹相对 `TruthWorld` 的 RMSE / 最大偏差；
+   - 重叠区（`path[cut2:cut1]`）从真值位姿投线的墙端点落在合并地图上的
+     比例（允许 2~3 个栅格的独立噪声容差），与单次跑完基准应基本一致。
+
+对应自动化：`TestSplitSelfConsistentReg` 与
+`TestMergeMatchesSingleRunReg`。
 
 ```go
 a, b, fullTruth := synth.SplitSessions(world, path, opt, 30, 24)

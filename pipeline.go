@@ -219,12 +219,12 @@ func (p *Pipeline) ProcessFrame(fr Frame) FrameDecision {
 		mr = matchScan(fcfg, prevWorld, clean, pred)
 	}
 	if !mr.CoarseOK {
-		return p.commitDegraded(fr, odomDelta, ReasonDegenerate, "no coarse match")
+		return p.commitDegraded(fr, clean, pred, odomDelta, ReasonDegenerate, "no coarse match")
 	}
 	dTrans := math.Hypot(mr.Pose.X-pred.X, mr.Pose.Y-pred.Y)
 	dRot := math.Abs(normAngle(mr.Pose.Theta - pred.Theta))
 	if dTrans > p.cfg.MaxMatchTransErr || dRot > p.cfg.MaxMatchRotErr {
-		return p.commitDegraded(fr, odomDelta, ReasonMatchDivergence,
+		return p.commitDegraded(fr, clean, pred, odomDelta, ReasonMatchDivergence,
 			fmt.Sprintf("dxy=%.3f dth=%.3f score=%.2f", dTrans, dRot, mr.Score))
 	}
 
@@ -237,7 +237,7 @@ func (p *Pipeline) ProcessFrame(fr Frame) FrameDecision {
 	ddx := matchDelta.X - odomDelta.X
 	ddy := matchDelta.Y - odomDelta.Y
 	if d := math.Hypot(ddx, ddy); d > p.cfg.MaxDeltaConflict {
-		return p.commitDegraded(fr, odomDelta, ReasonMatchDivergence,
+		return p.commitDegraded(fr, clean, pred, odomDelta, ReasonMatchDivergence,
 			fmt.Sprintf("delta_conflict=%.3f score=%.2f", d, mr.Score))
 	}
 	if mr.EigRatio < p.cfg.MinEigRatio {
@@ -337,8 +337,21 @@ func (p *Pipeline) advanceScanOnly(fr Frame, clean []Point, restart bool) FrameD
 		fmt.Sprintf("score=%.2f scan-only", mr.Score))
 }
 
-func (p *Pipeline) commitDegraded(fr Frame, odomDelta Pose, reason, detail string) FrameDecision {
-	return p.advanceFused(fr, nil, odomDelta, odomDelta, 0, 0,
+// commitDegraded trusts odometry for the pose. The valid scan is kept ONLY
+// when the pose lies in genuinely unmapped terrain (no keyframe surface of
+// ANY session nearby): that is first-time exploration and must be recorded,
+// otherwise every later session re-explores the same leg and repeated
+// save/load cycles never converge. Inside already-mapped terrain a degraded
+// match means the scan cannot be trusted here, so no keyframe/map update is
+// made (the surface already exists), preventing duplicate/drifted nodes in
+// the overlap area.
+func (p *Pipeline) commitDegraded(fr Frame, clean []Point, pred Pose, odomDelta Pose, reason, detail string) FrameDecision {
+	scanForKF := clean
+	if p.session == 0 ||
+		p.hasMappedSurfaceNearLocked(pred, p.cfg.RevisitSearchRadius*2) {
+		scanForKF = nil
+	}
+	return p.advanceFused(fr, scanForKF, odomDelta, odomDelta, 0, 0,
 		OutcomeDegraded, reason, detail)
 }
 
@@ -394,6 +407,20 @@ func (p *Pipeline) advanceFused(fr Frame, clean []Point,
 		fr.Scan.ID, fr.Scan.Time, strings.ToUpper(string(outcome)),
 		reason, detail, pose)
 	return d
+}
+
+// hasMappedSurfaceNearLocked reports whether any existing keyframe (of any
+// session) has a surface within radius of pose. It distinguishes genuinely
+// unmapped terrain (first-time exploration: degraded scans are still mapped
+// at the odometry pose) from already-surveyed terrain (a degraded scan is
+// untrusted and must not add a duplicate node).
+func (p *Pipeline) hasMappedSurfaceNearLocked(pose Pose, radius float64) bool {
+	for _, kf := range p.graph.Nodes {
+		if PoseDist(kf.Pose, pose) <= radius && len(kf.Surface) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Pipeline) referencePointsLocked(pred Pose) []Point {

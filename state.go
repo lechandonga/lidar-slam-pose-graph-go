@@ -82,7 +82,19 @@ func (p *Pipeline) snapshotStateLocked() savedState {
 		Session: p.session, FrameIDBase: p.frameIDBase,
 		AwaitAnchor: p.awaitAnchor,
 	}
+	st.Decisions = capTail(st.Decisions, p.cfg.PersistedLogCap)
+	st.LoopLog = capTail(st.LoopLog, p.cfg.PersistedLogCap)
+	st.OptLog = capTail(st.OptLog, p.cfg.PersistedLogCap)
 	return st
+}
+
+// capTail keeps at most cap elements (the most recent) of s. A non-positive
+// cap means unbounded.
+func capTail[S ~[]E, E any](s S, capn int) S {
+	if capn <= 0 || len(s) <= capn {
+		return s
+	}
+	return s[len(s)-capn:]
 }
 
 // Save atomically writes the full state to path. It writes to a sibling
@@ -180,6 +192,10 @@ func LoadState(path string, logger Logger) (*Pipeline, error) {
 		return nil, fmt.Errorf("%w: got %d, this build supports versions %d..%d",
 			ErrUnsupportedState, st.Version, minStateVersion, stateVersion)
 	}
+	// Repair config fields added after this file was written (gob decodes
+	// them as zero). Done before validation so an older, otherwise-valid
+	// file resumes with every safeguard active rather than zeroed values.
+	st.Config.fillLegacyDefaults()
 	// A constructible pipeline is created only after full validation, so a
 	// malformed file can never produce a half-new/half-old pipeline.
 	if err := st.validate(); err != nil {

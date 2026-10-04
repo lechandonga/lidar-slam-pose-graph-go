@@ -122,10 +122,32 @@ type Config struct {
 	// across sessions so odom-proximity loop search cannot find them).
 	LocalizeCrossSessionRadius float64
 	LocalizeCrossMinScore      float64 // accept only strong cross-session matches
+	// RevisitReuseRadius / RevisitReuseTheta: when a new session's scan at
+	// the anchor pose (or a later keyframe pose) is geometrically
+	// indistinguishable from an existing keyframe of another session, the
+	// pipeline links to the existing keyframe instead of duplicating nodes,
+	// edges and map cells. Re-surveying the same area then converges to a
+	// stable graph size; genuinely new terrain still grows normally.
+	RevisitReuseRadius float64
+	RevisitReuseTheta  float64
+	// RevisitReuseMinScore is the scan-alignment score required to treat an
+	// existing keyframe as the same physical vantage point.
+	RevisitReuseMinScore float64
+	// RevisitSearchRadius/Theta bound how far the live pose estimate may
+	// have drifted (between two independent passes) while still allowing a
+	// keyframe to be recognized as an already-mapped vantage point.
+	RevisitSearchRadius float64
+	RevisitSearchTheta  float64
 
 	// --- Runtime ---
 	OptEveryNKeyframes int // incremental optimization cadence
 	RNGSeed            int64
+	// PersistedLogCap bounds how many per-frame/loop/optimization decision
+	// records are written into a state file (the most recent are kept).
+	// These logs are diagnostics, not map state: bounding them prevents the
+	// saved file from growing without limit during very long runs or many
+	// identical re-survey cycles, even when no new terrain is added.
+	PersistedLogCap int
 }
 
 // DefaultConfig returns validated defaults for a small indoor platform.
@@ -209,8 +231,15 @@ func DefaultConfig() Config {
 		LocalizeCrossSessionRadius: 1.5,
 		LocalizeCrossMinScore:      0.70,
 
+		RevisitReuseRadius:   0.25,
+		RevisitReuseTheta:    0.18,
+		RevisitReuseMinScore: 0.60,
+		RevisitSearchRadius:  1.0,
+		RevisitSearchTheta:   0.6,
+
 		OptEveryNKeyframes: 5,
 		RNGSeed:            1,
+		PersistedLogCap:    4000,
 	}
 }
 
@@ -223,5 +252,29 @@ func (c *Config) validate() {
 	}
 	if math.IsNaN(c.FieldInflate) {
 		panic("slam: invalid config")
+	}
+}
+
+// fillLegacyDefaults repairs fields that were introduced after an older
+// state file was written: gob leaves newly added Config fields at their zero
+// value, which would otherwise silently disable safeguards (log bounding,
+// revisit convergence) or divide by zero. Every missing/invalid field is
+// replaced by its current default while explicitly-set fields are kept, so
+// a valid old file loads into a fully-working pipeline instead of a
+// half-defaulted one.
+func (c *Config) fillLegacyDefaults() {
+	d := DefaultConfig()
+	rep := func(ptr *float64, def float64) {
+		if *ptr == 0 || math.IsNaN(*ptr) || math.IsInf(*ptr, 0) {
+			*ptr = def
+		}
+	}
+	rep(&c.RevisitReuseRadius, d.RevisitReuseRadius)
+	rep(&c.RevisitReuseTheta, d.RevisitReuseTheta)
+	rep(&c.RevisitSearchRadius, d.RevisitSearchRadius)
+	rep(&c.RevisitSearchTheta, d.RevisitSearchTheta)
+	rep(&c.RevisitReuseMinScore, d.RevisitReuseMinScore)
+	if c.PersistedLogCap <= 0 {
+		c.PersistedLogCap = d.PersistedLogCap
 	}
 }

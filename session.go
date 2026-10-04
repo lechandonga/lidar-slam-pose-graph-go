@@ -3,7 +3,10 @@
 // world frame.
 package slam
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
 
 // PrepareNewSession arms a loaded pipeline for a brand-new independent
 // session (separate power cycle, own odom/clock origin). After this call
@@ -95,6 +98,16 @@ func (p *Pipeline) BeginSession(fr Frame, lr LocalizeResult) error {
 		Time:    fr.Scan.Time, Pose: pose,
 	})
 	p.addAnchorEdgesLocked(idx, lr)
+	// If the anchored vantage point is geometrically the same place an
+	// earlier session already keyframed (repeated load/run/save over the
+	// same overlap), coalesce the duplicate node: keep the new trajectory
+	// point (its FrameID must stay unique) but retarget it at the existing
+	// keyframe and drop the just-added node/anchor edges. Repeated
+	// re-surveys then cannot grow the graph round after round.
+	if reuse := p.findReuseKeyframeLocked(pose, clean, idx); reuse >= 0 {
+		p.coalesceAnchorNodeLocked(idx, reuse, fr, pose)
+		idx = reuse
+	}
 
 	p.frameCount++
 	d := p.decide(Frame{
@@ -106,6 +119,97 @@ func (p *Pipeline) BeginSession(fr Frame, lr LocalizeResult) error {
 		p.session, lr.Score, lr.Residual, pose)
 	_ = d
 	return nil
+}
+
+// findReuseKeyframeLocked returns an existing keyframe of another session
+// close to pose whose scan aligns strongly with clean at pose, or -1.
+func (p *Pipeline) findReuseKeyframeLocked(pose Pose, clean []Point, newIdx int) int {
+	best, bestScore := -1, p.cfg.RevisitReuseMinScore
+	var globalField *likelihoodField
+	if p.grid != nil && p.grid.w > 0 {
+		globalField = buildLikelihoodField(p.grid.hitCellsWorld(),
+			p.cfg.FieldResolution, p.cfg.FieldInflate)
+	}
+	for j, kf := range p.graph.Nodes {
+		if j == newIdx || kf.Session == p.session {
+			continue
+		}
+		// Pre-filter generously: the live pose estimate may have drifted by
+		// a fraction of a metre relative to the earlier pass. The tight
+		// decision is made on the CONVERGED scan alignment below, not on
+		// this raw distance.
+		if PoseDist(kf.Pose, pose) > p.cfg.RevisitSearchRadius {
+			continue
+		}
+		if math.Abs(normAngle(kf.Pose.Theta-pose.Theta)) > p.cfg.RevisitSearchTheta {
+			continue
+		}
+		localSurface := rasterizeHits(kf.Scan, p.cfg.MapResolution)
+		lcfg := p.cfg
+		// Search window covers inter-pass drift; reuse is accepted only if
+		// the converged relative transform is ~zero (same physical vantage)
+		// AND the implied world pose lands on the candidate.
+		lcfg.MatchWinXY = p.cfg.RevisitSearchRadius
+		lcfg.MatchWinTheta = p.cfg.RevisitSearchTheta
+		lcfg.CoarseStepXY = 0.12
+		lcfg.CoarseStepTheta = 0.08
+		lcfg.RefineIter = 12
+		mr := matchScan(lcfg, localSurface, subsample(clean, 240),
+			Between(kf.Pose, pose))
+		moved := math.Hypot(mr.Pose.X, mr.Pose.Y)
+		turned := math.Abs(mr.Pose.Theta)
+		implied := kf.Pose.Compose(mr.Pose)
+		sameVantage := moved <= p.cfg.RevisitReuseRadius &&
+			turned <= p.cfg.RevisitReuseTheta &&
+			PoseDist(implied, kf.Pose) <= p.cfg.RevisitReuseRadius &&
+			math.Abs(normAngle(implied.Theta-kf.Pose.Theta)) <= p.cfg.RevisitReuseTheta
+		if mr.CoarseOK && mr.Score > bestScore && sameVantage {
+			// Independent confirmation against the GLOBAL map: a nearby
+			// keyframe in freshly explored terrain is absent from the grid,
+			// so a local scan that merely resembles a distant corridor
+			// segment cannot trigger reuse of an actually-new vantage.
+			if globalField != nil {
+				gs, _ := relocWeightedScore(globalField, pose, clean)
+				if gs < p.cfg.LocalizeMinScore {
+					continue
+				}
+			}
+			// Prefer a candidate already connected to the running chain:
+			// this makes the reuse mapping identical across repeated
+			// replays of the same data, so graph size converges instead of
+			// linking a slightly different keyframe each round.
+			best, bestScore = j, mr.Score
+		}
+	}
+	return best
+}
+
+// coalesceAnchorNodeLocked removes the freshly appended duplicate anchor
+// node newIdx and its edges, links session bookkeeping to the existing
+// keyframe reuseIdx, and retargets the anchor trajectory point at it.
+func (p *Pipeline) coalesceAnchorNodeLocked(newIdx, reuseIdx int, fr Frame, pose Pose) {
+	reuse := p.graph.Nodes[reuseIdx]
+	kept := p.graph.Edges[:0]
+	for _, e := range p.graph.Edges {
+		if e.I == newIdx || e.J == newIdx {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	p.graph.Edges = kept
+	p.graph.Nodes = append(p.graph.Nodes[:newIdx], p.graph.Nodes[newIdx+1:]...)
+	for i, kf := range p.graph.Nodes {
+		kf.ID = i
+	}
+	// Retarget the just-appended anchor trajectory point to the reused
+	// keyframe's pose (same physical vantage point).
+	last := &p.traj[len(p.traj)-1]
+	last.Pose = reuse.Pose
+	p.lastPose = reuse.Pose
+	p.lastKF = reuseIdx
+	p.lastKFOdom = Pose{}
+	p.log.Framef("session=%d anchor COALESCED onto existing kf=%d pose=%s",
+		p.session, reuseIdx, reuse.Pose)
 }
 
 // AwaitAnchor reports whether the pipeline is loaded and waiting for a
